@@ -1,0 +1,88 @@
+#!/bin/bash
+# =============================================================================
+# GVFA + conformal prediction -- full sweep on NCI Gadi.
+#
+# Gadi has no PBS job arrays, so one job runs many experiments side by side
+# with nci-parallel. Three stages, in order:
+#   1. prepare  RDKit descriptors + shared split, one task per dataset
+#   2. embed    GVFA embeddings, one task per dataset x node-features x dim
+#   3. runs     every experiment; reads the caches only
+# then merges all results into results/all_results.csv.
+#
+# Finished experiments are skipped, so if the job hits its walltime just
+# submit it again with the same settings and it continues.
+#
+# Submit from the project root, one group per job:
+#   qsub -v SWEEP_GROUPS=ED nci/sweep.pbs
+#   qsub -v SWEEP_GROUPS=tox21 nci/sweep.pbs
+#   qsub -v SWEEP_GROUPS=HTSFP10 -l ncpus=192,mem=760GB nci/sweep.pbs
+# Untuned baseline instead of tuned:
+#   qsub -v SWEEP_GROUPS=ED,TUNE=0 nci/sweep.pbs
+# Small pilot (one dim, no tuning) to measure run times first:
+#   qsub -v SWEEP_GROUPS=ED,TUNE=0,DIMS=500 -l walltime=04:00:00 nci/sweep.pbs
+# (qsub -v separates variables with commas, so values use spaces: DIMS="500 1000")
+# =============================================================================
+#PBS -P jq77
+#PBS -q normal
+#PBS -N gvfa_sweep
+#PBS -l ncpus=96
+#PBS -l mem=380GB
+#PBS -l jobfs=20GB
+#PBS -l walltime=48:00:00
+#PBS -l storage=scratch/jq77
+#PBS -l wd
+#PBS -j oe
+
+# ---------------- settings (edit here, or override with qsub -v) -------------
+ROOT=${ROOT:-/scratch/jq77/nk8155/Binary_classification/binary_classification}
+PY=${PY:-/scratch/jq77/nk8155/envs/gvfa/bin/python}   # python of the gvfa env
+SWEEP_GROUPS=${SWEEP_GROUPS:-ED}                      # ED tox21 HTSFP10
+TUNE=${TUNE:-50}                                      # Optuna trials for xgb; 0 = untuned
+FEATURES=${FEATURES:-"gvfa concat bundle"}
+RDKIT=${RDKIT:-1}                                     # 1 = also rdkit-only baseline
+DIMS=${DIMS:-"100 500 1000 2000 5000 10000"}
+NODE_FEATURES=${NODE_FEATURES:-"7 18"}
+CLFS=${CLFS:-"xgb rf lr"}
+BALANCE=${BALANCE:-0}                                 # "0 1" runs both
+FOLDS=${FOLDS:-10}
+SEED=${SEED:-42}
+NCORES_PER_TASK=${NCORES_PER_TASK:-12}                # 12 = one NUMA node (normal queue)
+TASK_TIMEOUT=${TASK_TIMEOUT:-172800}                  # s; nci-parallel kills a task after this
+# -----------------------------------------------------------------------------
+
+module load nci-parallel/1.0.0a
+
+cd "$ROOT" || { echo "cannot cd to $ROOT"; exit 1; }
+[ -x "$PY" ] || { echo "python not found: $PY"; exit 1; }
+
+JOB=${PBS_JOBID%%.*}
+CMDS=nci/cmds/$JOB                                    # per job: parallel jobs never share
+mkdir -p "$CMDS" logs
+
+echo "== $(date '+%F %T') job $JOB on $PBS_NCPUS cores, groups: $SWEEP_GROUPS, tune: $TUNE"
+"$PY" nci/make_commands.py \
+    --groups $SWEEP_GROUPS --features $FEATURES --rdkit "$RDKIT" \
+    --dims $DIMS --node-features $NODE_FEATURES --clfs $CLFS --balance $BALANCE \
+    --tune "$TUNE" --folds "$FOLDS" --seed "$SEED" \
+    --threads "$NCORES_PER_TASK" --python "$PY" --out-dir "$CMDS" || exit 1
+
+run_stage() {
+    local file=$1 n
+    n=$(wc -l < "$file")
+    echo "== $(date '+%F %T') $(basename "$file"): $n tasks"
+    [ "$n" -eq 0 ] && return 0
+    mpirun -np $((PBS_NCPUS / NCORES_PER_TASK)) \
+           --map-by ppr:$((12 / NCORES_PER_TASK)):NUMA:PE=$NCORES_PER_TASK \
+           nci-parallel --input-file "$file" --timeout "$TASK_TIMEOUT"
+}
+
+run_stage "$CMDS/stage1_prepare.txt"
+run_stage "$CMDS/stage2_embed.txt"
+run_stage "$CMDS/stage3_runs.txt"
+
+echo "== $(date '+%F %T') merging results"
+"$PY" collect_results.py --latest
+
+echo "== $(date '+%F %T') done"
+echo "failed tasks (if any):"
+grep -l "Traceback" logs/*/*.log 2>/dev/null | head -50

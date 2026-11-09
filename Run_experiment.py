@@ -36,10 +36,28 @@ Usage:
                       computed on the original SMILES molecule. Only the input
                       to the encoder changes; projection, GraphCNN and the
                       conformal protocol are identical.
+
+Outputs (one set of files per run, nothing is appended, so parallel cluster
+jobs cannot corrupt each other):
+
+  results/metrics/<group>/<run_id>.csv            4 rows, one per confidence level
+  results/pvalues/<group>/<run_id>_p-values.csv   per-molecule p-values (test set)
+  results/configs/<group>/<run_id>.json           every setting, classifier params,
+                                                  package versions, host, PBS job
+
+  run_id = <dataset>_<features>[_nf<N>_dim<D>]_<clf>[_bal][_tune<T>]_seed<S>_k<K>
+           __<YYYYmmdd-HHMMSS>[_job<PBS id>]
+  e.g.     AID_743122_gvfa_nf18_dim500_xgb_seed42_k10__20261109-185214_job123456
+
+  python collect_results.py   merges results/metrics/**.csv into one table.
+  --results-dir changes the root; --out additionally appends to one CSV (legacy).
 '''
 
 import argparse
 import json
+import os
+import platform
+import re
 import sys
 import time
 from pathlib import Path
@@ -63,9 +81,56 @@ from src.create_graph_new import create_graph_list as create_graph_list_18
 from src.VSA_conversion import VSA_conversion
 from src.embeddings import getEmbedding
 from src import utilities
+from src.result_naming import short_dataset_name, run_tag
 from models.graphcnnVSA_Binding_FULL import GraphCNN
 
 EPS_LEVELS = (0.30, 0.20, 0.10, 0.05)
+
+
+# ===========================================================================
+# result file naming
+# ===========================================================================
+def save_npy_atomic(path, X):
+    """Write to a temp file, then rename. Parallel tasks never see a half-written
+    cache file, and a killed job never leaves a corrupt one behind."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f'{path.name}.{os.getpid()}.tmp')
+    with open(tmp, 'wb') as f:
+        np.save(f, X)
+    os.replace(tmp, path)
+
+
+def new_run_id(tag, started, metrics_dir):
+    """tag + start time (+ PBS job id); never overwrites an earlier run."""
+    stamp = time.strftime('%Y%m%d-%H%M%S', time.localtime(started))
+    job = os.environ.get('PBS_JOBID', '').split('.')[0]
+    run_id = f'{tag}__{stamp}' + (f'_job{job}' if job else '')
+    candidate, n = run_id, 1
+    while (metrics_dir / f'{candidate}.csv').exists():
+        candidate, n = f'{run_id}-{n}', n + 1
+    return candidate
+
+
+def classifier_params(model):
+    """Parameters of the fitted classifier (last fold; all folds share them)."""
+    est = model.steps[-1][1] if hasattr(model, 'steps') else model
+    return {k: v for k, v in est.get_params(deep=False).items()
+            if not callable(v)}
+
+
+def package_versions():
+    import sklearn, xgboost, rdkit
+    out = {'python': platform.python_version(), 'numpy': np.__version__,
+           'pandas': pd.__version__, 'torch': torch.__version__,
+           'sklearn': sklearn.__version__, 'xgboost': xgboost.__version__,
+           'rdkit': rdkit.__version__}
+    try:
+        import torch_geometric
+        out['torch_geometric'] = torch_geometric.__version__
+    except ImportError:
+        pass
+    return out
 
 
 # ===========================================================================
@@ -96,8 +161,7 @@ def gvfa_embeddings(dataset, name, dim, cache_dir, split_tag,
         emb, _ = getEmbedding(model, torch.device('cpu'), hvs)
     X = emb.squeeze(0).numpy().astype(np.float32)
 
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    np.save(cache, X)
+    save_npy_atomic(cache, X)
     return X
 
 
@@ -107,8 +171,7 @@ def rdkit_descriptors(df, name, cache_dir, split_tag):
     if cache.exists():
         return np.load(cache)
     X = utilities.generate_desc_96(df['smiles']).to_numpy(dtype=np.float32)
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    np.save(cache, X)
+    save_npy_atomic(cache, X)
     return X
 
 
@@ -145,9 +208,12 @@ def assemble(features, D_tr, D_te, E_tr, E_te, dim, seed):
 # ===========================================================================
 # classifiers
 # ===========================================================================
+N_JOBS = 10      # threads per classifier; set from --n-jobs in main()
+
+
 def xgb_space(trial, pos_weight, eval_metric):
     return dict(
-        n_estimators=2000, eval_metric=eval_metric, random_state=42, n_jobs=10,
+        n_estimators=2000, eval_metric=eval_metric, random_state=42, n_jobs=N_JOBS,
         early_stopping_rounds=100, tree_method='hist', scale_pos_weight=pos_weight,
         learning_rate=trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
         max_depth=trial.suggest_int('max_depth', 3, 10),
@@ -161,7 +227,7 @@ def xgb_space(trial, pos_weight, eval_metric):
 
 def xgb_default(pos_weight, eval_metric):
     return dict(n_estimators=2000, eval_metric=eval_metric, random_state=42,
-                n_jobs=10, early_stopping_rounds=100, tree_method='hist',
+                n_jobs=N_JOBS, early_stopping_rounds=100, tree_method='hist',
                 scale_pos_weight=pos_weight, learning_rate=0.03, max_depth=7,
                 subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0, reg_alpha=0.0)
 
@@ -171,7 +237,7 @@ def build(clf, params, balance):
         return XGBClassifier(**params)
     if clf == 'rf':
         return RandomForestClassifier(
-            n_estimators=500, n_jobs=10, random_state=42,     # was unseeded
+            n_estimators=500, n_jobs=N_JOBS, random_state=42,  # was unseeded
             class_weight='balanced_subsample' if balance else None)
     if clf == 'lr':
         return make_pipeline(                                  # was unscaled
@@ -248,9 +314,25 @@ def main():
     ap.add_argument('--eval-metric', default='aucpr', choices=['aucpr', 'logloss'])
     ap.add_argument('--group', default='')
     ap.add_argument('--cache-dir', default='cache')
-    ap.add_argument('--out', default='results.csv')
-    ap.add_argument('--pval-dir', default='pvalues')
+    ap.add_argument('--results-dir', default='results',
+                    help='root folder for metrics/, pvalues/ and configs/')
+    ap.add_argument('--out', default=None,
+                    help='optional: also append the metric rows to this one CSV')
+    ap.add_argument('--pval-dir', default=None,
+                    help='optional: override <results-dir>/pvalues/<group>')
+    ap.add_argument('--n-jobs', type=int,
+                    default=int(os.environ.get('OMP_NUM_THREADS', 10)),
+                    help='threads for the classifier and torch '
+                         '(default: $OMP_NUM_THREADS, else 10)')
+    ap.add_argument('--prepare-only', action='store_true',
+                    help='build and cache the feature blocks and the splits, '
+                         'then stop (no classifier, no results). Used by the '
+                         'cluster sweep so parallel runs only read caches.')
     args = ap.parse_args()
+
+    global N_JOBS
+    N_JOBS = args.n_jobs
+    torch.set_num_threads(args.n_jobs)
 
     t0 = time.time()
     name = dataset_name_from_path(args.infile)
@@ -287,11 +369,17 @@ def main():
         print(f'SKIP {name}: {e}')
         sys.exit(0)
 
+    if args.prepare_only:
+        print(f'prepared {name}: features={args.features} '
+              f'nf={args.node_features} dim={args.dim}; splits ready')
+        return
+
     n_per_class = {c: int((y_train == c).sum()) for c in (0, 1)}
     pos_weight = n_per_class[0] / max(n_per_class[1], 1) if args.balance else 1.0
 
     # ---- optional tuning, on fold 0's fit rows only -----------------------
     params = xgb_default(pos_weight, args.eval_metric)
+    tune_info = None
     if args.tune and args.clf == 'xgb':
         import optuna
         from sklearn.model_selection import train_test_split
@@ -321,7 +409,13 @@ def main():
             sampler=optuna.samplers.TPESampler(seed=args.seed))
         study.optimize(objective, n_trials=args.tune)
         print(f'optuna best {study.best_value:.4f}: {study.best_params}')
+        # The trials searched colsample_bynode with colsample_bytree at its
+        # XGBoost default of 1.0; the default dict sets 0.8. Reset it so the
+        # model that runs is the one the winning trial actually evaluated.
+        params['colsample_bytree'] = 1.0
         params.update(study.best_params)
+        tune_info = {'n_trials': args.tune, 'best_value': study.best_value,
+                     'best_params': study.best_params}
 
     # ---- cross-conformal loop --------------------------------------------
     fold_cal, fold_test = [], []
@@ -341,40 +435,84 @@ def main():
     pvals = cross_conformal_pvalues(fold_cal, fold_test, n_per_class)
 
     # ---- report -----------------------------------------------------------
-    nf_tag = '' if args.node_features == 7 or args.features == 'rdkit' \
-        else f'_nf{args.node_features}'
-    tag = (f'{name}_{args.features}{nf_tag}_dim{args.dim}_{args.clf}'
-           f'_seed{args.seed}_k{args.folds}')
+    group = args.group or 'nogroup'
+    dataset = short_dataset_name(args.infile)
+    tag = run_tag(dataset, args.features, args.node_features, args.dim, args.clf,
+                  args.balance, args.tune, args.seed, args.folds)
+    root = Path(args.results_dir)
+    metrics_dir = root / 'metrics' / group
+    pval_dir = Path(args.pval_dir) if args.pval_dir else root / 'pvalues' / group
+    config_dir = root / 'configs' / group
+    for d in (metrics_dir, pval_dir, config_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    run_id = new_run_id(tag, t0, metrics_dir)
+    started = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t0))
+    runtime = round(time.time() - t0, 1)
+    tuned = tune_info is not None
+    clf_params = classifier_params(model)
 
-    Path(args.pval_dir).mkdir(parents=True, exist_ok=True)
+    pval_path = pval_dir / f'{run_id}_p-values.csv'
     pd.DataFrame({'id': df_test['id'].astype(str),
                   '0': pvals[:, 0], '1': pvals[:, 1],
-                  'class': y_test, 'model': tag}
-                 ).to_csv(Path(args.pval_dir) / f'{tag}_p-values.csv',
-                          sep='\t', index=False)
+                  'class': y_test, 'model': tag, 'run_id': run_id}
+                 ).to_csv(pval_path, sep='\t', index=False)
 
     rows = []
     for eps in EPS_LEVELS:
         m = cp_metrics(pvals, y_test, eps)
-        m.update(group=args.group, dataset=name, features=args.features,
+        m.update(run_id=run_id, tag=tag, started=started,
+                 group=args.group, dataset=dataset, dataset_file=name,
+                 features=args.features,
                  dim=args.dim if args.features != 'rdkit' else 0,
                  node_features=args.node_features if args.features != 'rdkit' else 0,
                  clf=args.clf, seed=args.seed, folds=args.folds,
-                 tuned=bool(args.tune), balance=args.balance,
+                 tuned=tuned, n_trials=args.tune if tuned else 0,
+                 balance=args.balance,
+                 eval_metric=args.eval_metric if args.clf == 'xgb' else '',
                  n_train=len(y_train), n_active_train=n_per_class[1],
                  n_test=len(y_test), n_active_test=int(y_test.sum()),
                  n_cal_active=n_per_class[1],
                  min_cal_needed=min_calib_per_class(eps),
                  feasible=feasible[eps],
-                 runtime_s=round(time.time() - t0, 1))
+                 runtime_s=runtime,
+                 clf_params=json.dumps(clf_params, sort_keys=True, default=str))
         rows.append(m)
         print(f'  conf {m["conf"]:.2f}  eff {m["eff"]:.3f}  '
               f'err_act {m["err_active"]:.3f}  err_inact {m["err_inactive"]:.3f}  '
               f'valid {m["valid"]}  feasible {m["feasible"]}')
 
-    out = Path(args.out)
-    pd.DataFrame(rows).to_csv(out, mode='a', index=False, header=not out.exists())
-    print(f'appended {len(rows)} rows to {out}')
+    metrics = pd.DataFrame(rows)
+    metrics_path = metrics_dir / f'{run_id}.csv'
+    metrics.to_csv(metrics_path, index=False)
+
+    config = {'run_id': run_id, 'tag': tag, 'started': started,
+              'runtime_s': runtime, 'dataset': dataset,
+              'train_file': str(args.infile), 'test_file': str(args.predfile),
+              'args': vars(args), 'classifier_params': clf_params,
+              'tuning': tune_info, 'eps_levels': list(EPS_LEVELS),
+              'feasible': {str(k): bool(v) for k, v in feasible.items()},
+              'n_train': len(y_train), 'n_active_train': n_per_class[1],
+              'n_test': len(y_test), 'n_active_test': int(y_test.sum()),
+              'outputs': {'metrics': str(metrics_path), 'pvalues': str(pval_path)},
+              'host': platform.node(), 'pbs_jobid': os.environ.get('PBS_JOBID', ''),
+              'command': ' '.join(sys.argv), 'versions': package_versions()}
+    config_path = config_dir / f'{run_id}.json'
+    config_path.write_text(json.dumps(config, indent=2, default=str))
+
+    print(f'saved  metrics {metrics_path}\n       p-values {pval_path}\n'
+          f'       config  {config_path}')
+
+    if args.out:                                   # optional legacy single CSV
+        out = Path(args.out)
+        if out.exists():
+            header = out.open().readline().strip().split(',')
+            if header != list(metrics.columns):
+                print(f'NOT appended to {out}: its columns differ from this run '
+                      f'(written by an older version). Rename it and rerun, or '
+                      f'use collect_results.py instead.')
+                return
+        metrics.to_csv(out, mode='a', index=False, header=not out.exists())
+        print(f'appended {len(rows)} rows to {out}')
 
 
 if __name__ == '__main__':
