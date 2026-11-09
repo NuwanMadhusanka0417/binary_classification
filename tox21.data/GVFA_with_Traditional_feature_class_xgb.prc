@@ -1,0 +1,12 @@
+python ../../GVFA_with_Traditional_feature_class.py -m x -i tox21.data_NR-AhR.txt_numatms_gt_2.data.tr_0.2_1.txt -p tox21.data_NR-AhR.txt_numatms_gt_2.data.te_0.2_1.txt
+python ../../GVFA_with_Traditional_feature_class.py -m x -i tox21.data_NR-AR-LBD.txt_numatms_gt_2.data.tr_0.2_1.txt -p tox21.data_NR-AR-LBD.txt_numatms_gt_2.data.te_0.2_1.txt
+python ../../GVFA_with_Traditional_feature_class.py -m x -i tox21.data_NR-Aromatase.txt_numatms_gt_2.data.tr_0.2_1.txt -p tox21.data_NR-Aromatase.txt_numatms_gt_2.data.te_0.2_1.txt
+python ../../GVFA_with_Traditional_feature_class.py -m x -i tox21.data_NR-AR.txt_numatms_gt_2.data.tr_0.2_1.txt -p tox21.data_NR-AR.txt_numatms_gt_2.data.te_0.2_1.txt
+python ../../GVFA_with_Traditional_feature_class.py -m x -i tox21.data_NR-ER-LBD.txt_numatms_gt_2.data.tr_0.2_1.txt -p tox21.data_NR-ER-LBD.txt_numatms_gt_2.data.te_0.2_1.txt
+python ../../GVFA_with_Traditional_feature_class.py -m x -i tox21.data_NR-ER.txt_numatms_gt_2.data.tr_0.2_1.txt -p tox21.data_NR-ER.txt_numatms_gt_2.data.te_0.2_1.txt
+python ../../GVFA_with_Traditional_feature_class.py -m x -i tox21.data_NR-PPAR-gamma.txt_numatms_gt_2.data.tr_0.2_1.txt -p tox21.data_NR-PPAR-gamma.txt_numatms_gt_2.data.te_0.2_1.txt
+python ../../GVFA_with_Traditional_feature_class.py -m x -i tox21.data_SR-ARE.txt_numatms_gt_2.data.tr_0.2_1.txt -p tox21.data_SR-ARE.txt_numatms_gt_2.data.te_0.2_1.txt
+python ../../GVFA_with_Traditional_feature_class.py -m x -i tox21.data_SR-ATAD5.txt_numatms_gt_2.data.tr_0.2_1.txt -p tox21.data_SR-ATAD5.txt_numatms_gt_2.data.te_0.2_1.txt
+python ../../GVFA_with_Traditional_feature_class.py -m x -i tox21.data_SR-HSE.txt_numatms_gt_2.data.tr_0.2_1.txt -p tox21.data_SR-HSE.txt_numatms_gt_2.data.te_0.2_1.txt
+python ../../GVFA_with_Traditional_feature_class.py -m x -i tox21.data_SR-MMP.txt_numatms_gt_2.data.tr_0.2_1.txt -p tox21.data_SR-MMP.txt_numatms_gt_2.data.te_0.2_1.txt
+python ../../GVFA_with_Traditional_feature_class.py -m x -i tox21.data_SR-p53.txt_numatms_gt_2.data.tr_0.2_1.txt -p tox21.data_SR-p53.txt_numatms_gt_2.data.te_0.2_1.txt
