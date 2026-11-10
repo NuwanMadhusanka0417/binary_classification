@@ -90,6 +90,9 @@ EPS_LEVELS = (0.30, 0.20, 0.10, 0.05)
 # ===========================================================================
 # result file naming
 # ===========================================================================
+EMBED_CHUNK = 2000   # molecules projected/encoded at once (multiple of getEmbedding's 100)
+
+
 def save_npy_atomic(path, X):
     """Write to a temp file, then rename. Parallel tasks never see a half-written
     cache file, and a killed job never leaves a corrupt one behind."""
@@ -154,12 +157,29 @@ def gvfa_embeddings(dataset, name, dim, cache_dir, split_tag,
         graphs = create_graph_list_18(dataset, smiles)
     else:
         graphs = create_graph_list(dataset)
-    hvs = VSA_conversion(graphs, dim)
-    model = GraphCNN(hvs[0].node_features.shape[1], 5, 1, 'sum', 'sum',
-                     torch.device('cpu'), 10)
-    with torch.no_grad():                       # encoder is never trained
-        emb, _ = getEmbedding(model, torch.device('cpu'), hvs)
-    X = emb.squeeze(0).numpy().astype(np.float32)
+
+    # Project and encode EMBED_CHUNK molecules at a time. Projecting the whole
+    # set at once holds every atom as a D-wide vector (HTSFP10, D=10000: ~44 GB).
+    # Same result: W is regenerated from the same fixed seed for every call of
+    # VSA_conversion, and each molecule's embedding depends only on its own
+    # graph (block-diagonal adjacency and per-graph pooling).
+    # Chunks must be whole multiples of getEmbedding's batch of 100: then every
+    # batch holds exactly the molecules it held before and the output is
+    # byte-identical. Other sizes shift batch boundaries (~1e-8 rounding).
+    if EMBED_CHUNK % 100:
+        raise ValueError(f'EMBED_CHUNK={EMBED_CHUNK} must be a multiple of 100')
+    model, parts = None, []
+    for start in range(0, len(graphs), EMBED_CHUNK):
+        hvs = VSA_conversion(graphs[start:start + EMBED_CHUNK], dim)
+        if model is None:
+            model = GraphCNN(hvs[0].node_features.shape[1], 5, 1, 'sum', 'sum',
+                             torch.device('cpu'), 10)
+        with torch.no_grad():                   # encoder is never trained
+            emb, _ = getEmbedding(model, torch.device('cpu'), hvs)
+        parts.append(emb.squeeze(0).numpy().astype(np.float32))
+        for g in hvs:                           # free the D-wide node vectors
+            g.node_features = None
+    X = np.concatenate(parts, axis=0)
 
     save_npy_atomic(cache, X)
     return X

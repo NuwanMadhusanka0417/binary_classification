@@ -16,6 +16,7 @@ stamp), only the most recent run. Use it after re-running a setting; leave it
 off to keep every repeat (e.g. to look at run-to-run variation).
 '''
 import argparse
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -48,7 +49,9 @@ def main():
 
     out = Path(args.out) if args.out else Path(args.results_dir) / 'all_results.csv'
     out.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out, index=False)
+    tmp = out.with_name(f'{out.name}.{os.getpid()}.tmp')   # two jobs finishing at
+    df.to_csv(tmp, index=False)                            # once never leave a
+    os.replace(tmp, out)                                   # half-written table
 
     print(f'{len(files)} files, {n_runs} runs -> {df["run_id"].nunique()} runs '
           f'kept, {len(df)} rows written to {out}')

@@ -1,32 +1,41 @@
 #!/bin/bash
 # =============================================================================
-# GVFA + conformal prediction -- full sweep on NCI Gadi.
+# GVFA + conformal prediction -- full sweep on NCI Gadi, ONE node per job.
 #
-# Gadi has no PBS job arrays, so one job runs many experiments side by side
-# with nci-parallel. Three stages, in order:
-#   1. prepare  RDKit descriptors + shared split, one task per dataset
-#   2. embed    GVFA embeddings, one task per dataset x node-features x dim
-#   3. runs     every experiment; reads the caches only
-# then merges all results into results/all_results.csv.
+# One normal-queue node = 48 cores, 190 GB. nci-parallel runs several
+# experiments side by side inside the job (Gadi has no PBS job arrays):
+#   NCORES_PER_TASK=12  4 tasks at once, ~47 GB each   (default; enough for
+#                       every group incl. HTSFP10 at D=10000)
+#   NCORES_PER_TASK=24  2 tasks at once, ~95 GB each   (if a task runs out of memory)
+#   NCORES_PER_TASK=48  1 task at a time, 190 GB
+# To go faster, submit more one-node jobs (one per group), not a bigger job.
 #
-# Finished experiments are skipped, so if the job hits its walltime just
-# submit it again with the same settings and it continues.
+# Stages (STAGES selects which run in this job):
+#   1  prepare  RDKit descriptors + shared split, one task per dataset
+#   2  embed    GVFA embeddings, one task per dataset x node-features x dim
+#   3  runs     every experiment; reads the caches only
+# Finished work is skipped, so if the job hits its walltime submit it again.
 #
-# Submit from the project root, one group per job:
-#   qsub -v SWEEP_GROUPS=ED nci/sweep.pbs
-#   qsub -v SWEEP_GROUPS=tox21 nci/sweep.pbs
-#   qsub -v SWEEP_GROUPS=HTSFP10 -l ncpus=192,mem=760GB nci/sweep.pbs
-# Untuned baseline instead of tuned:
-#   qsub -v SWEEP_GROUPS=ED,TUNE=0 nci/sweep.pbs
-# Small pilot (one dim, no tuning) to measure run times first:
-#   qsub -v SWEEP_GROUPS=ED,TUNE=0,DIMS=500 -l walltime=04:00:00 nci/sweep.pbs
-# (qsub -v separates variables with commas, so values use spaces: DIMS="500 1000")
+# Submit from the project root.
+#   One job per group, all three stages (the jobs can run at the same time):
+#     qsub -v SWEEP_GROUPS=ED nci/sweep.pbs
+#     qsub -v SWEEP_GROUPS=tox21 nci/sweep.pbs
+#     qsub -v SWEEP_GROUPS=HTSFP10 nci/sweep.pbs
+#   Untuned baseline:            qsub -v SWEEP_GROUPS=ED,TUNE=0 nci/sweep.pbs
+#   Pilot to measure run times:  qsub -v SWEEP_GROUPS=ED,TUNE=0,DIMS=500 -l walltime=04:00:00 nci/sweep.pbs
+#   Split one big group over several nodes: prepare once, then run
+#   classifiers in parallel jobs that start when the preparation succeeded:
+#     J=$(qsub -v SWEEP_GROUPS=HTSFP10,STAGES="1 2" nci/sweep.pbs)
+#     qsub -W depend=afterok:$J -v SWEEP_GROUPS=HTSFP10,STAGES=3,CLFS=xgb nci/sweep.pbs
+#     qsub -W depend=afterok:$J -v SWEEP_GROUPS=HTSFP10,STAGES=3,CLFS="rf lr" nci/sweep.pbs
+#   Do NOT run two jobs with stage 1 for the same group at the same time.
+# (qsub -v separates variables with commas, so lists use spaces: DIMS="500 1000")
 # =============================================================================
 #PBS -P jq77
 #PBS -q normal
 #PBS -N gvfa_sweep
-#PBS -l ncpus=96
-#PBS -l mem=380GB
+#PBS -l ncpus=48
+#PBS -l mem=190GB
 #PBS -l jobfs=20GB
 #PBS -l walltime=48:00:00
 #PBS -l storage=scratch/jq77
@@ -37,6 +46,7 @@
 ROOT=${ROOT:-/scratch/jq77/nk8155/Binary_classification/binary_classification}
 PY=${PY:-/scratch/jq77/nk8155/envs/gvfa/bin/python}   # python of the gvfa env
 SWEEP_GROUPS=${SWEEP_GROUPS:-ED}                      # ED tox21 HTSFP10
+STAGES=${STAGES:-"1 2 3"}
 TUNE=${TUNE:-50}                                      # Optuna trials for xgb; 0 = untuned
 FEATURES=${FEATURES:-"gvfa concat bundle"}
 RDKIT=${RDKIT:-1}                                     # 1 = also rdkit-only baseline
@@ -46,9 +56,17 @@ CLFS=${CLFS:-"xgb rf lr"}
 BALANCE=${BALANCE:-0}                                 # "0 1" runs both
 FOLDS=${FOLDS:-10}
 SEED=${SEED:-42}
-NCORES_PER_TASK=${NCORES_PER_TASK:-12}                # 12 = one NUMA node (normal queue)
+NCORES_PER_TASK=${NCORES_PER_TASK:-12}                # 12, 24 or 48 (see top)
 TASK_TIMEOUT=${TASK_TIMEOUT:-172800}                  # s; nci-parallel kills a task after this
 # -----------------------------------------------------------------------------
+
+case $NCORES_PER_TASK in                              # pin each task to its own cores
+    1|2|3|4|6|12) MAP="ppr:$((12 / NCORES_PER_TASK)):NUMA:PE=$NCORES_PER_TASK" ;;  # NCI's documented form
+    24)           MAP="ppr:1:socket:PE=24" ;;
+    48)           MAP="ppr:1:node:PE=48" ;;
+    *) echo "NCORES_PER_TASK must be 1,2,3,4,6,12,24 or 48"; exit 1 ;;
+esac
+NTASKS=$((PBS_NCPUS / NCORES_PER_TASK))
 
 module load nci-parallel/1.0.0a
 
@@ -59,7 +77,10 @@ JOB=${PBS_JOBID%%.*}
 CMDS=nci/cmds/$JOB                                    # per job: parallel jobs never share
 mkdir -p "$CMDS" logs
 
-echo "== $(date '+%F %T') job $JOB on $PBS_NCPUS cores, groups: $SWEEP_GROUPS, tune: $TUNE"
+MEM_GB=$(( ${PBS_VMEM:-204010946560} / 1073741824 ))
+echo "== $(date '+%F %T') job $JOB: $PBS_NCPUS cores, ~${MEM_GB} GB; $NTASKS tasks x $NCORES_PER_TASK cores" \
+     "(~$((MEM_GB / NTASKS)) GB each); groups: $SWEEP_GROUPS; stages: $STAGES; tune: $TUNE"
+
 "$PY" nci/make_commands.py \
     --groups $SWEEP_GROUPS --features $FEATURES --rdkit "$RDKIT" \
     --dims $DIMS --node-features $NODE_FEATURES --clfs $CLFS --balance $BALANCE \
@@ -71,14 +92,18 @@ run_stage() {
     n=$(wc -l < "$file")
     echo "== $(date '+%F %T') $(basename "$file"): $n tasks"
     [ "$n" -eq 0 ] && return 0
-    mpirun -np $((PBS_NCPUS / NCORES_PER_TASK)) \
-           --map-by ppr:$((12 / NCORES_PER_TASK)):NUMA:PE=$NCORES_PER_TASK \
+    mpirun -np "$NTASKS" --map-by "$MAP" \
            nci-parallel --input-file "$file" --timeout "$TASK_TIMEOUT"
 }
 
-run_stage "$CMDS/stage1_prepare.txt"
-run_stage "$CMDS/stage2_embed.txt"
-run_stage "$CMDS/stage3_runs.txt"
+for s in $STAGES; do
+    case $s in
+        1) run_stage "$CMDS/stage1_prepare.txt" ;;
+        2) run_stage "$CMDS/stage2_embed.txt" ;;
+        3) run_stage "$CMDS/stage3_runs.txt" ;;
+        *) echo "unknown stage $s" ;;
+    esac
+done
 
 echo "== $(date '+%F %T') merging results"
 "$PY" collect_results.py --latest
@@ -86,3 +111,8 @@ echo "== $(date '+%F %T') merging results"
 echo "== $(date '+%F %T') done"
 echo "failed tasks (if any):"
 grep -l "Traceback" logs/*/*.log 2>/dev/null | head -50
+echo "killed (out of memory / timeout) tasks show up as logs without a 'saved' line:"
+for f in logs/*/*.log; do
+    case $f in *__prepare.log|*__embed_*) continue ;; esac
+    grep -q "^saved" "$f" || grep -q "SKIP" "$f" || echo "  $f"
+done 2>/dev/null | head -50
