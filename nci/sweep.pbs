@@ -31,7 +31,11 @@
 #   Do NOT run two jobs with stage 1 for the same group at the same time.
 # (qsub -v separates variables with commas, so a LIST uses +: DIMS=500+1000)
 # =============================================================================
-#PBS -P jq77
+# Compute is charged to mi23 (both earlier jobs reported "Project: mi23",
+# whatever -P said), while the code and data live on /scratch/jq77 -- so the
+# compute project and the storage mount below are deliberately different.
+# If nci_account disagrees, change this line and the storage line together.
+#PBS -P mi23
 #PBS -q normal
 #PBS -N gvfa_sweep
 #PBS -l ncpus=48
@@ -168,6 +172,7 @@ echo "failed tasks (if any):"
 grep -l "Traceback" logs/*/*.log 2>/dev/null | head -50
 echo "killed (out of memory / timeout) tasks show up as logs without a 'saved' line:"
 for f in logs/*/*.log; do
+    [ -e "$f" ] || continue          # no logs at all: don't print the glob itself
     case $f in *__prepare.log|*__embed_*) continue ;; esac
     grep -q "^saved" "$f" || grep -q "SKIP" "$f" || echo "  $f"
 done 2>/dev/null | head -50

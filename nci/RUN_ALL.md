@@ -73,17 +73,19 @@ nci_account
 lquota
 ```
 
-`nci/sweep.pbs` has `#PBS -P jq77` and `#PBS -l storage=scratch/jq77`, but a
-failed job earlier reported `Project: mi23`. If `nci_account` says your budget
-is in **mi23**, either add `-P mi23` to every `qsub` below, or fix the script
-once. Charging `mi23` while the data sits on `/scratch/jq77` needs **both**
-storage mounts:
+`nci/sweep.pbs` now says `#PBS -P mi23` with `#PBS -l storage=scratch/jq77`,
+because both earlier jobs reported `Project: mi23` while the code and data sit
+on `/scratch/jq77`. That split is normal: compute charged to one project,
+storage mounted from another. Only change it if `nci_account` disagrees —
+and then change both lines together.
+
+Now check the Python the jobs will use — the two paths the script defaults to:
 
 ```
-sed -i 's|^#PBS -P jq77|#PBS -P mi23|; s|^#PBS -l storage=scratch/jq77|#PBS -l storage=scratch/jq77+scratch/mi23|' nci/sweep.pbs
+ls -d /scratch/jq77/nk8155/Binary_classification/binary_classification && ls -l /scratch/jq77/nk8155/tft_env/bin/python
 ```
 
-Now check the Python the jobs will use. `sweep.pbs` defaults to `tft_env`:
+`sweep.pbs` defaults to exactly those, so no `-v ROOT=` or `-v PY=` is needed:
 
 ```
 module load python3/3.8.5 && . /scratch/jq77/nk8155/tft_env/bin/activate && python -c "import sys,numpy,pandas,sklearn,torch,xgboost,rdkit,torch_geometric,optuna; print(sys.version); print('all imports ok')"
@@ -104,6 +106,20 @@ python nci/make_commands.py --groups ED tox21 HTSFP10 --tune 50 --out-dir /tmp/c
 ```
 
 Expect `45 commands`, `540 commands`, and `experiments: 4995 in the grid`.
+
+Look at one generated line. It must be plain words — no `cd`, no `&&`, no
+`>` — starting with `/bin/bash .../nci/run_task.sh`:
+
+```
+head -1 /tmp/cmdcheck/stage1_prepare.txt
+```
+
+You can run that one line by hand to smoke-test the whole chain before
+queuing anything; it builds one dataset's descriptors and split:
+
+```
+eval "$(head -1 /tmp/cmdcheck/stage1_prepare.txt)" ; echo "exit=$?" ; tail -3 logs/ED/*__prepare.log
+```
 
 > If you build the pinned `gvfa` conda environment later, submit with
 > `-v PY=/scratch/jq77/nk8155/envs/gvfa/bin/python,PY_MODULES=`
