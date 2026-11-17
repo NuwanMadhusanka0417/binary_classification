@@ -13,6 +13,12 @@ nci-parallel inside nci/sweep.pbs:
   stage3_runs.txt     one line per experiment (dataset x features x nf x dim x
                       classifier x balance). Reads the caches only.
 
+Each line is `/bin/bash nci/run_task.sh <root> <threads> <log> <python> ...`:
+nci-parallel execs its input lines WITHOUT a shell, so a line cannot contain
+`cd`, `&&`, `VAR=value` prefixes or `> log` redirection. run_task.sh does all
+of that. Every word a line is built from is checked for shell metacharacters,
+because nci-parallel cannot be relied on to honour quoting either.
+
 Runs whose metrics file already exists in results/metrics/<group>/<tag>__*.csv
 are left out, so re-submitting the same job continues where it stopped.
 Lines are ordered largest dataset / dimension first, so the slowest tasks start
@@ -24,7 +30,7 @@ Usage (from the project root):
 '''
 import argparse
 import itertools
-import shlex
+import re
 import sys
 from pathlib import Path
 
@@ -106,20 +112,29 @@ def main():
     cache_dir = ROOT / args.cache_dir
     out_dir = ROOT / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    py = shlex.quote(args.python)
     t = args.threads
-    # PYTHONUNBUFFERED: a task killed by the OOM killer or the timeout still
-    # leaves its log up to the point it died, instead of an empty file.
-    env = (f'OMP_NUM_THREADS={t} MKL_NUM_THREADS={t} OPENBLAS_NUM_THREADS={t} '
-           f'TF_CPP_MIN_LOG_LEVEL=3 PYTHONUNBUFFERED=1')
+    runner = ROOT / 'nci' / 'run_task.sh'
+    if not runner.exists():
+        raise SystemExit(f'missing {runner}')
+    # characters a shell would act on; ~ # ! are literal mid-word, so allowed
+    UNSAFE = re.compile(r'''[\s'"|&;<>()$`\*?\[\]{}]''')
 
     def command(tr, te, group, log, extra):
-        q = shlex.quote
-        return (f'cd {q(str(ROOT))} && {env} {py} Run_experiment.py '
-                f'-i {q(str(tr))} -p {q(str(te))} --group {q(group)} '
-                f'--seed {args.seed} --folds {args.folds} --n-jobs {t} '
-                f'--cache-dir {q(args.cache_dir)} --results-dir {q(args.results_dir)} '
-                f'{extra} > {q(log)} 2>&1')
+        # nci-parallel execs this line directly -- no shell -- so it must be
+        # plain whitespace-separated words. run_task.sh does the cd, the
+        # thread limits and the redirection.
+        words = ['/bin/bash', str(runner), str(ROOT), str(t), log, args.python,
+                 '-i', str(tr), '-p', str(te), '--group', group,
+                 '--seed', str(args.seed), '--folds', str(args.folds),
+                 '--n-jobs', str(t),
+                 '--cache-dir', args.cache_dir,
+                 '--results-dir', args.results_dir] + list(extra)
+        bad = [w for w in words if not w or UNSAFE.search(w)]
+        if bad:
+            raise SystemExit(
+                'these task arguments would need shell quoting, which '
+                'nci-parallel cannot do: ' + repr(bad))
+        return ' '.join(words)
 
     stage1, stage2, stage3 = [], [], []
     n_total = n_done = 0
@@ -131,14 +146,16 @@ def main():
             size = tr.stat().st_size                      # cost proxy for ordering
 
             if not prepared(cache_dir, tr.name, args.seed):
-                stage1.append((size, command(tr, te, group, f'{log_dir}/{ds}__prepare.log',
-                                             '--features rdkit --prepare-only')))
+                stage1.append((size, command(
+                    tr, te, group, f'{log_dir}/{ds}__prepare.log',
+                    ['--features', 'rdkit', '--prepare-only'])))
             for nf, dim in itertools.product(args.node_features, args.dims):
                 if embedded(cache_dir, tr.name, nf, dim):
                     continue
                 stage2.append((size * dim, command(
                     tr, te, group, f'{log_dir}/{ds}__embed_nf{nf}_dim{dim}.log',
-                    f'--features gvfa --node-features {nf} --dim {dim} --prepare-only')))
+                    ['--features', 'gvfa', '--node-features', str(nf),
+                     '--dim', str(dim), '--prepare-only'])))
 
             grid = [(f, nf, d) for f in args.features
                     for nf in args.node_features for d in args.dims]
@@ -152,13 +169,13 @@ def main():
                 if finished(results_dir, group, tag):
                     n_done += 1
                     continue
-                extra = f'--features {feat} --clf {clf}'
+                extra = ['--features', feat, '--clf', clf]
                 if feat != 'rdkit':
-                    extra += f' --node-features {nf} --dim {dim}'
+                    extra += ['--node-features', str(nf), '--dim', str(dim)]
                 if bal:
-                    extra += ' --balance'
+                    extra += ['--balance']
                 if tune:
-                    extra += f' --tune {tune}'
+                    extra += ['--tune', str(tune)]
                 cost = size * max(dim, 100) * (args.tune if tune else 1)
                 stage3.append((cost, command(tr, te, group, f'{log_dir}/{tag}.log', extra)))
 

@@ -25,11 +25,11 @@
 #   Pilot to measure run times:  qsub -v SWEEP_GROUPS=ED,TUNE=0,DIMS=500 -l walltime=04:00:00 nci/sweep.pbs
 #   Split one big group over several nodes: prepare once, then run
 #   classifiers in parallel jobs that start when the preparation succeeded:
-#     J=$(qsub -v SWEEP_GROUPS=HTSFP10,STAGES="1 2" nci/sweep.pbs)
+#     J=$(qsub -v SWEEP_GROUPS=HTSFP10,STAGES=1+2 nci/sweep.pbs)
 #     qsub -W depend=afterok:$J -v SWEEP_GROUPS=HTSFP10,STAGES=3,CLFS=xgb nci/sweep.pbs
-#     qsub -W depend=afterok:$J -v SWEEP_GROUPS=HTSFP10,STAGES=3,CLFS="rf lr" nci/sweep.pbs
+#     qsub -W depend=afterok:$J -v SWEEP_GROUPS=HTSFP10,STAGES=3,CLFS=rf+lr nci/sweep.pbs
 #   Do NOT run two jobs with stage 1 for the same group at the same time.
-# (qsub -v separates variables with commas, so lists use spaces: DIMS="500 1000")
+# (qsub -v separates variables with commas, so a LIST uses +: DIMS=500+1000)
 # =============================================================================
 #PBS -P jq77
 #PBS -q normal
@@ -44,7 +44,9 @@
 
 # ---------------- settings (edit here, or override with qsub -v) -------------
 ROOT=${ROOT:-/scratch/jq77/nk8155/Binary_classification/binary_classification}
-PY=${PY:-/scratch/jq77/nk8155/envs/gvfa/bin/python}   # python of the gvfa env
+PY=${PY:-/scratch/jq77/nk8155/tft_env/bin/python}     # python that runs the code
+PY_MODULES=${PY_MODULES:-python3/3.8.5}               # module tft_env was built on;
+                                                      # set PY_MODULES="" for a conda env
 SWEEP_GROUPS=${SWEEP_GROUPS:-ED}                      # ED tox21 HTSFP10
 STAGES=${STAGES:-"1 2 3"}
 TUNE=${TUNE:-50}                                      # Optuna trials for xgb; 0 = untuned
@@ -60,6 +62,13 @@ NCORES_PER_TASK=${NCORES_PER_TASK:-12}                # 12, 24 or 48 (see top)
 TASK_TIMEOUT=${TASK_TIMEOUT:-172800}                  # s; nci-parallel kills a task after this
 # -----------------------------------------------------------------------------
 
+# qsub -v separates variables with COMMAS, so a list passed on the command line
+# uses PLUS signs: -v DIMS=500+1000,CLFS=rf+lr,STAGES=1+2
+# (spaces are still fine for the defaults set above, inside this file).
+for v in SWEEP_GROUPS STAGES FEATURES DIMS NODE_FEATURES CLFS BALANCE; do
+    eval "$v=\$(echo \"\${$v}\" | tr '+' ' ')"
+done
+
 case $NCORES_PER_TASK in                              # pin each task to its own cores
     1|2|3|4|6|12) MAP="ppr:$((12 / NCORES_PER_TASK)):NUMA:PE=$NCORES_PER_TASK" ;;  # NCI's documented form
     24)           MAP="ppr:1:socket:PE=24" ;;
@@ -69,13 +78,26 @@ esac
 NTASKS=$((PBS_NCPUS / NCORES_PER_TASK))
 
 module load nci-parallel/1.0.0a
+[ -n "$PY_MODULES" ] && module load $PY_MODULES
 
 cd "$ROOT" || { echo "cannot cd to $ROOT"; exit 1; }
 [ -x "$PY" ] || { echo "python not found: $PY"; exit 1; }
 
+# fail here, not 4000 tasks in: check every import the runs need
+"$PY" -c '
+import importlib.util, sys
+need = ["numpy", "pandas", "sklearn", "torch", "xgboost", "rdkit", "torch_geometric"]
+miss = [m for m in need if importlib.util.find_spec(m) is None]
+print("python", sys.version.split()[0], "| missing:", miss or "nothing")
+sys.exit(1 if miss else 0)' || { echo "ABORT: packages missing in $PY"; exit 1; }
+if [ "$TUNE" -gt 0 ] && ! "$PY" -c 'import optuna' 2>/dev/null; then
+    echo "ABORT: TUNE=$TUNE needs optuna, which $PY does not have (or use TUNE=0)"; exit 1
+fi
+
 JOB=${PBS_JOBID%%.*}
 CMDS=nci/cmds/$JOB                                    # per job: parallel jobs never share
-mkdir -p "$CMDS" logs
+RESULTS=${RESULTS:-results}                           # where every run writes
+mkdir -p "$CMDS" logs "$RESULTS" cache splits
 
 MEM_GB=$(( ${PBS_VMEM:-204010946560} / 1073741824 ))
 echo "== $(date '+%F %T') job $JOB: $PBS_NCPUS cores, ~${MEM_GB} GB; $NTASKS tasks x $NCORES_PER_TASK cores" \
@@ -85,28 +107,61 @@ echo "== $(date '+%F %T') job $JOB: $PBS_NCPUS cores, ~${MEM_GB} GB; $NTASKS tas
     --groups $SWEEP_GROUPS --features $FEATURES --rdkit "$RDKIT" \
     --dims $DIMS --node-features $NODE_FEATURES --clfs $CLFS --balance $BALANCE \
     --tune "$TUNE" --folds "$FOLDS" --seed "$SEED" \
-    --threads "$NCORES_PER_TASK" --python "$PY" --out-dir "$CMDS" || exit 1
+    --threads "$NCORES_PER_TASK" --python "$PY" \
+    --results-dir "$RESULTS" --out-dir "$CMDS" || exit 1
+
+count_metrics() { find "$RESULTS/metrics" -name '*.csv' 2>/dev/null | wc -l; }
 
 run_stage() {
-    local file=$1 n
+    local file=$1 n before after
     n=$(wc -l < "$file")
     echo "== $(date '+%F %T') $(basename "$file"): $n tasks"
     [ "$n" -eq 0 ] && return 0
+    before=$(find logs -name '*.log' 2>/dev/null | wc -l)
     mpirun -np "$NTASKS" --map-by "$MAP" \
            nci-parallel --input-file "$file" --timeout "$TASK_TIMEOUT"
+    # job 184162620 ran all three stages in 34 s because not one task started.
+    # Stop at the first stage that produces no log at all, rather than marching
+    # on through the other stages and then reporting "done".
+    after=$(find logs -name '*.log' 2>/dev/null | wc -l)
+    if [ "$after" -le "$before" ]; then
+        echo "ABORT: $n tasks were launched and not one log file appeared, so"
+        echo "       the tasks are not starting. The first task line was:"
+        head -1 "$file"
+        exit 1
+    fi
 }
 
 for s in $STAGES; do
     case $s in
-        1) run_stage "$CMDS/stage1_prepare.txt" ;;
-        2) run_stage "$CMDS/stage2_embed.txt" ;;
-        3) run_stage "$CMDS/stage3_runs.txt" ;;
+        1) run_stage "$CMDS/stage1_prepare.txt"
+           echo "   splits: $(ls splits/*.json 2>/dev/null | wc -l)," \
+                "descriptor caches: $(ls cache/*_desc96.npy 2>/dev/null | wc -l)" ;;
+        2) run_stage "$CMDS/stage2_embed.txt"
+           echo "   embedding caches: $(ls cache/*_dim*.npy 2>/dev/null | wc -l)," \
+                "$(du -sh cache 2>/dev/null | cut -f1) on disk" ;;
+        3) before_m=$(count_metrics)
+           run_stage "$CMDS/stage3_runs.txt"
+           after_m=$(count_metrics)
+           echo "   metrics files: $before_m -> $after_m ($((after_m - before_m)) new)"
+           if [ "$after_m" -le "$before_m" ]; then
+               echo "ABORT: stage 3 ran but wrote no results into $RESULTS/metrics."
+               echo "       Look at the task logs named just above, and at:"
+               grep -l "Traceback" logs/*/*.log 2>/dev/null | head -5
+               exit 1
+           fi ;;
         *) echo "unknown stage $s" ;;
     esac
 done
 
 echo "== $(date '+%F %T') merging results"
-"$PY" collect_results.py --latest
+"$PY" collect_results.py --results-dir "$RESULTS" --latest || true   # none yet is not a failure
+
+echo "== $(date '+%F %T') results in $ROOT/$RESULTS"
+echo "   metrics : $(count_metrics) files   ($RESULTS/metrics/<group>/<run_id>.csv)"
+echo "   pvalues : $(find "$RESULTS/pvalues" -name '*.csv' 2>/dev/null | wc -l) files"
+echo "   configs : $(find "$RESULTS/configs" -name '*.json' 2>/dev/null | wc -l) files"
+echo "   merged  : $RESULTS/all_results.csv"
 
 echo "== $(date '+%F %T') done"
 echo "failed tasks (if any):"
