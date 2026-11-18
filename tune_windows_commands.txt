@@ -1,0 +1,295 @@
+# =============================================================================
+# WINDOWS PC ONLY — POWERSHELL COMMANDS — DO NOT RUN ON GADI
+#
+# Correct prompt:   PS C:\Users\...\Binary_classification>
+# Wrong prompt:     (env2) [nk8155@gadi-login-01 ...]$
+#
+# HOW TO USE THIS FILE
+# 1. On your Windows PC, open PowerShell (not Command Prompt and not Gadi).
+# 2. Copy and run STEP 1 one command at a time. STEP 1 is needed only once.
+# 3. Run every command in STEP 2. STEP 2 is required in each new PowerShell
+#    session; it limits CPU/RAM and defines the dataset variable $D.
+# 4. Confirm both Test-Path commands print True.
+# 5. Run STEPS 3 onward one at a time, in order. Wait for each Python command
+#    to finish before starting the next one.
+#
+# This PC has 16 GB RAM, so every model uses only two CPU threads. The current
+# code fine-tunes only XGBoost. Random Forest and Logistic Regression are fixed
+# comparison models.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# STEP 1 — RUN ONCE: create and check the Python 3.8 CPU environment
+# -----------------------------------------------------------------------------
+
+Set-Location "C:\Users\22390013@students.ltu.edu.au\OneDrive - LA TROBE UNIVERSITY\Projects\Binary_classification"
+
+# Confirm that Python 3.8 is installed.
+py -3.8 --version
+
+# Create and activate a dedicated environment.
+py -3.8 -m venv .venv38
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv38\Scripts\Activate.ps1
+
+# Install the pinned CPU-only libraries.
+python -m pip install --upgrade "pip==24.3.1" wheel
+python -m pip install --no-cache-dir -r requirements.txt
+
+# Confirm that CPU PyTorch and the required libraries work.
+python -c "import torch, torch_geometric, xgboost, optuna, rdkit, sklearn; print('torch:', torch.__version__); print('CUDA available:', torch.cuda.is_available()); print('imports: OK')"
+
+# CUDA available must print False.
+
+
+# -----------------------------------------------------------------------------
+# STEP 2 — RUN EVERY NEW POWERSHELL SESSION: activate and limit memory use
+# -----------------------------------------------------------------------------
+
+# Activate the environment if this is a new PowerShell session.
+.\.venv38\Scripts\Activate.ps1
+
+# Yes, run every command below. These settings apply only to this PowerShell
+# window and prevent libraries from using all CPU cores and excessive memory.
+$env:OMP_NUM_THREADS = "2"
+$env:MKL_NUM_THREADS = "2"
+$env:OPENBLAS_NUM_THREADS = "2"
+$env:NUMEXPR_NUM_THREADS = "2"
+$env:PYTHONUNBUFFERED = "1"
+$env:PYTHONNOUSERSITE = "1"
+
+New-Item -ItemType Directory -Force -Path "logs\windows_tuning" | Out-Null
+
+# Representative ED dataset used for classifier selection.
+$D = "msc_new\AID_1159555_datatable.csv_pivot_class_std_smi_no_stereochem_no_salt.data"
+
+# Confirm that both input files exist.
+Test-Path "$D.tr_0.2_1.txt"
+Test-Path "$D.te_0.2_1.txt"
+
+
+# -----------------------------------------------------------------------------
+# STEP 3 — RUN: establish the untuned XGBoost baseline
+# Results: results_windows\01_xgb_rdkit_untuned
+# -----------------------------------------------------------------------------
+
+python Run_experiment.py `
+  -i "$D.tr_0.2_1.txt" `
+  -p "$D.te_0.2_1.txt" `
+  --group ED `
+  --features rdkit `
+  --clf xgb `
+  --tune 0 `
+  --folds 10 `
+  --seed 42 `
+  --n-jobs 2 `
+  --results-dir "results_windows\01_xgb_rdkit_untuned" `
+  2>&1 | Tee-Object -FilePath "logs\windows_tuning\01_xgb_rdkit_untuned.log"
+
+python collect_results.py --results-dir "results_windows\01_xgb_rdkit_untuned" --latest
+
+
+# -----------------------------------------------------------------------------
+# STEP 4 — RUN: fine-tune XGBoost without class balancing
+# Optuna performs 50 trials over all eight XGBoost parameters.
+# Results: results_windows\02_xgb_rdkit_tuned
+# -----------------------------------------------------------------------------
+
+python Run_experiment.py `
+  -i "$D.tr_0.2_1.txt" `
+  -p "$D.te_0.2_1.txt" `
+  --group ED `
+  --features rdkit `
+  --clf xgb `
+  --tune 50 `
+  --folds 10 `
+  --seed 42 `
+  --n-jobs 2 `
+  --results-dir "results_windows\02_xgb_rdkit_tuned" `
+  2>&1 | Tee-Object -FilePath "logs\windows_tuning\02_xgb_rdkit_tuned.log"
+
+python collect_results.py --results-dir "results_windows\02_xgb_rdkit_tuned" --latest
+
+
+# -----------------------------------------------------------------------------
+# STEP 5 — RUN: fine-tune XGBoost with class balancing
+# Compare this result with STEP 4.
+# Results: results_windows\03_xgb_rdkit_tuned_balanced
+# -----------------------------------------------------------------------------
+
+python Run_experiment.py `
+  -i "$D.tr_0.2_1.txt" `
+  -p "$D.te_0.2_1.txt" `
+  --group ED `
+  --features rdkit `
+  --clf xgb `
+  --balance `
+  --tune 50 `
+  --folds 10 `
+  --seed 42 `
+  --n-jobs 2 `
+  --results-dir "results_windows\03_xgb_rdkit_tuned_balanced" `
+  2>&1 | Tee-Object -FilePath "logs\windows_tuning\03_xgb_rdkit_tuned_balanced.log"
+
+python collect_results.py --results-dir "results_windows\03_xgb_rdkit_tuned_balanced" --latest
+
+
+# -----------------------------------------------------------------------------
+# STEP 6 — RUN: fixed Random Forest baseline
+# Random Forest is not fine-tuned by the current code.
+# Results: results_windows\04_rf_rdkit
+# -----------------------------------------------------------------------------
+
+python Run_experiment.py `
+  -i "$D.tr_0.2_1.txt" `
+  -p "$D.te_0.2_1.txt" `
+  --group ED `
+  --features rdkit `
+  --clf rf `
+  --folds 10 `
+  --seed 42 `
+  --n-jobs 2 `
+  --results-dir "results_windows\04_rf_rdkit" `
+  2>&1 | Tee-Object -FilePath "logs\windows_tuning\04_rf_rdkit.log"
+
+python collect_results.py --results-dir "results_windows\04_rf_rdkit" --latest
+
+
+# -----------------------------------------------------------------------------
+# STEP 7 — RUN: fixed balanced Random Forest baseline
+# Results: results_windows\05_rf_rdkit_balanced
+# -----------------------------------------------------------------------------
+
+python Run_experiment.py `
+  -i "$D.tr_0.2_1.txt" `
+  -p "$D.te_0.2_1.txt" `
+  --group ED `
+  --features rdkit `
+  --clf rf `
+  --balance `
+  --folds 10 `
+  --seed 42 `
+  --n-jobs 2 `
+  --results-dir "results_windows\05_rf_rdkit_balanced" `
+  2>&1 | Tee-Object -FilePath "logs\windows_tuning\05_rf_rdkit_balanced.log"
+
+python collect_results.py --results-dir "results_windows\05_rf_rdkit_balanced" --latest
+
+
+# -----------------------------------------------------------------------------
+# STEP 8 — RUN: fixed Logistic Regression baseline
+# Logistic Regression is not fine-tuned by the current code.
+# Results: results_windows\06_lr_rdkit
+# -----------------------------------------------------------------------------
+
+python Run_experiment.py `
+  -i "$D.tr_0.2_1.txt" `
+  -p "$D.te_0.2_1.txt" `
+  --group ED `
+  --features rdkit `
+  --clf lr `
+  --folds 10 `
+  --seed 42 `
+  --n-jobs 2 `
+  --results-dir "results_windows\06_lr_rdkit" `
+  2>&1 | Tee-Object -FilePath "logs\windows_tuning\06_lr_rdkit.log"
+
+python collect_results.py --results-dir "results_windows\06_lr_rdkit" --latest
+
+
+# -----------------------------------------------------------------------------
+# STEP 9 — RUN: fixed balanced Logistic Regression baseline
+# Results: results_windows\07_lr_rdkit_balanced
+# -----------------------------------------------------------------------------
+
+python Run_experiment.py `
+  -i "$D.tr_0.2_1.txt" `
+  -p "$D.te_0.2_1.txt" `
+  --group ED `
+  --features rdkit `
+  --clf lr `
+  --balance `
+  --folds 10 `
+  --seed 42 `
+  --n-jobs 2 `
+  --results-dir "results_windows\07_lr_rdkit_balanced" `
+  2>&1 | Tee-Object -FilePath "logs\windows_tuning\07_lr_rdkit_balanced.log"
+
+python collect_results.py --results-dir "results_windows\07_lr_rdkit_balanced" --latest
+
+
+# -----------------------------------------------------------------------------
+# STEP 10 — RUN AFTER STEPS 3-9: low-memory GVFA/XGBoost, dimension 100
+# This builds and caches GVFA embeddings.
+# Results: results_windows\08_xgb_concat_nf18_dim100_tuned
+# -----------------------------------------------------------------------------
+
+python Run_experiment.py `
+  -i "$D.tr_0.2_1.txt" `
+  -p "$D.te_0.2_1.txt" `
+  --group ED `
+  --features concat `
+  --node-features 18 `
+  --dim 100 `
+  --clf xgb `
+  --tune 50 `
+  --folds 10 `
+  --seed 42 `
+  --n-jobs 2 `
+  --results-dir "results_windows\08_xgb_concat_nf18_dim100_tuned" `
+  2>&1 | Tee-Object -FilePath "logs\windows_tuning\08_xgb_concat_nf18_dim100_tuned.log"
+
+python collect_results.py --results-dir "results_windows\08_xgb_concat_nf18_dim100_tuned" --latest
+
+
+# -----------------------------------------------------------------------------
+# STEP 11 — RUN ONLY IF STEP 10 SUCCEEDS: GVFA/XGBoost, dimension 500
+# Run only if the dimension-100 test completes without memory problems.
+# Results: results_windows\09_xgb_concat_nf18_dim500_tuned
+# -----------------------------------------------------------------------------
+
+python Run_experiment.py `
+  -i "$D.tr_0.2_1.txt" `
+  -p "$D.te_0.2_1.txt" `
+  --group ED `
+  --features concat `
+  --node-features 18 `
+  --dim 500 `
+  --clf xgb `
+  --tune 50 `
+  --folds 10 `
+  --seed 42 `
+  --n-jobs 2 `
+  --results-dir "results_windows\09_xgb_concat_nf18_dim500_tuned" `
+  2>&1 | Tee-Object -FilePath "logs\windows_tuning\09_xgb_concat_nf18_dim500_tuned.log"
+
+python collect_results.py --results-dir "results_windows\09_xgb_concat_nf18_dim500_tuned" --latest
+
+
+# -----------------------------------------------------------------------------
+# STEP 12 — RUN: inspect the saved best XGBoost parameters
+# Run after each tuned experiment as needed.
+# -----------------------------------------------------------------------------
+
+Get-ChildItem "results_windows\02_xgb_rdkit_tuned\configs\ED\*.json" |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1 |
+  Get-Content
+
+Get-ChildItem "results_windows\03_xgb_rdkit_tuned_balanced\configs\ED\*.json" |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1 |
+  Get-Content
+
+
+# -----------------------------------------------------------------------------
+# MEMORY SAFETY NOTES
+# -----------------------------------------------------------------------------
+#
+# 1. Keep --n-jobs 2 on a 16 GB computer.
+# 2. Run only one command at a time.
+# 3. Start with dimensions 100 and 500.
+# 4. Do not run dimensions 5000 or 10000 locally with 16 GB RAM.
+# 5. If memory usage is still high, change every --n-jobs 2 to --n-jobs 1.
+# 6. Use the NCI PBS sweep for all datasets and the complete dimension grid.
