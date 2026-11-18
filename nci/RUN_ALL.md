@@ -52,12 +52,94 @@ Two passes over the grid:
 Job 184162620 lost all 551 of its tasks because `nci-parallel` execs its input
 lines **without a shell**, so the old `cd ... && VAR=x python ... > log` lines
 could never run. `nci/run_task.sh` now does the `cd`, the thread limits and
-the redirection, and `make_commands.py` emits plain word lists. Copy the three
-files up before resubmitting anything:
+the redirection, and `make_commands.py` emits plain word lists.
+
+The Gadi copy is a clone of
+`github.com/NuwanMadhusanka0417/binary_classification`, so move code with git,
+not rsync. **On your laptop:**
 
 ```
-rsync -av nci/run_task.sh nci/make_commands.py nci/sweep.pbs nci/RUN_ALL.md gadi-dm.nci.org.au:/scratch/jq77/nk8155/Binary_classification/binary_classification/nci/
+git add -A && git commit -m "fix sweep harness" && git push
 ```
+
+**On Gadi:**
+
+```
+cd /scratch/jq77/nk8155/Binary_classification/binary_classification && git pull
+```
+
+An `rsync ... gadi-dm.nci.org.au:` command only works run *from* the laptop;
+run it on Gadi and it points Gadi at itself.
+
+---
+
+## Step 0b — the environment
+
+`sweep.pbs` now defaults to **env2** with `PY_MODULES=python3/3.8.5`:
+
+```
+PY=${PY:-/scratch/jq77/nk8155/env2/bin/python}
+PY_MODULES=${PY_MODULES:-python3/3.8.5}
+```
+
+`env2` is a Python 3.8 venv built on that module, so the module must be
+loaded or the interpreter will not start at all
+(`libpython3.8.so.1.0: cannot open shared object file`). Confirm it works and
+that nothing is missing, from a **clean** shell — never stack one venv on top
+of another:
+
+```
+exec bash -l
+```
+
+```
+module purge && module load python3/3.8.5 && unset PYTHONPATH PYTHONHOME && export PYTHONNOUSERSITE=1 && . /scratch/jq77/nk8155/env2/bin/activate && python -V && python -c "
+import sys; print('exe', sys.executable)
+for m in ['typing_extensions','numpy','scipy','pandas','sklearn','joblib','torch','torch_geometric','xgboost','rdkit','optuna']:
+    try:
+        mod = __import__(m); print('  OK   ', m, getattr(mod, '__version__', ''))
+    except Exception as e: print('  FAIL ', m, type(e).__name__, e)"
+```
+
+Compare the versions against the paper's pins — python 3.8.20, numpy 1.24.4,
+rdkit 2023.09.5, scikit-learn 1.0.2, torch 2.0.1, torch-geometric 2.6.1,
+xgboost 1.6.2. `optuna` is not in `environment.yml` at all and is only needed
+for `--tune`; untuned runs do not want it.
+
+Do NOT use `tft_env`. Its interpreter reports 3.11.0 while its compiled
+stdlib loads from `/apps/python3/3.11.7`, so every C extension fails with
+`undefined symbol: _PyModule_Add`, and its pip is broken.
+
+### If env2 turns out to be missing packages
+
+Build the paper's pinned environment instead, from a clean shell on a login
+node:
+
+```
+deactivate 2>/dev/null; module purge; bash nci/make_env.sh
+```
+
+It refuses to run while a venv is active or a python module is loaded,
+because that leak is what broke `tft_env`. Then add
+`-v PY=/scratch/jq77/nk8155/envs/gvfa/bin/python,PY_MODULES=` to each `qsub`
+(empty `PY_MODULES`, since a conda env needs no module).
+
+## Step 0c — superseded
+
+`tft_env` cannot be used. Its interpreter reports 3.11.0 but its compiled
+stdlib loads from `/apps/python3/3.11.7`, so every C extension dies with
+`undefined symbol: _PyModule_Add` — torch, xgboost, torch_geometric and
+optuna all fail. Its pip is broken too. Build the paper's pinned environment
+instead, from a **clean shell** on a login node:
+
+```
+deactivate 2>/dev/null; module purge; bash nci/make_env.sh
+```
+
+The script refuses to run while a venv is active or a python module is
+loaded, because that leak is what broke `tft_env`. Afterwards pass
+`-v PY=/scratch/jq77/nk8155/envs/gvfa/bin/python` on every `qsub`, or edit the
+`PY=` line in `nci/sweep.pbs` once.
 
 ---
 
@@ -88,14 +170,31 @@ ls -d /scratch/jq77/nk8155/Binary_classification/binary_classification && ls -l 
 `sweep.pbs` defaults to exactly those, so no `-v ROOT=` or `-v PY=` is needed:
 
 ```
-module load python3/3.8.5 && . /scratch/jq77/nk8155/tft_env/bin/activate && python -c "import sys,numpy,pandas,sklearn,torch,xgboost,rdkit,torch_geometric,optuna; print(sys.version); print('all imports ok')"
+cat /scratch/jq77/nk8155/tft_env/pyvenv.cfg ; /scratch/jq77/nk8155/tft_env/bin/python -V
 ```
 
-If `optuna` is the only thing missing, install it into that venv (needs
-internet, so a login node or the `copyq` queue):
+`tft_env` is a **Python 3.11** venv, so do NOT `module load python3/3.8.5`
+for it — that is a different interpreter and only pulls in intel-mkl.
+`PY_MODULES` is empty by default for this reason. If `pyvenv.cfg` shows a
+`home` under `/apps`, the venv was built on a module python and you must pass
+that module instead, e.g. `-v PY_MODULES=python3/3.11.0`.
+
+Now import everything the runs need, in one pass, so you find every gap at
+once instead of one per job:
 
 ```
-pip install --no-cache-dir optuna
+/scratch/jq77/nk8155/tft_env/bin/python -c "
+import sys; print('python', sys.version.split()[0])
+for m in ['typing_extensions','numpy','scipy','pandas','sklearn','joblib','torch','torch_geometric','xgboost','rdkit','optuna']:
+    try: __import__(m); print('  OK   ', m)
+    except Exception as e: print('  FAIL ', m, type(e).__name__, e)"
+```
+
+Install whatever says FAIL (login nodes have internet; `--no-cache-dir` keeps
+it out of your home quota):
+
+```
+. /scratch/jq77/nk8155/tft_env/bin/activate && pip install --no-cache-dir typing_extensions
 ```
 
 Finally, confirm the command generator sees all 45 datasets and counts the
@@ -261,7 +360,7 @@ qsub -v SWEEP_GROUPS=HTSFP10,STAGES=3,TUNE=50,CLFS=xgb,DIMS=2000+5000+10000 nci/
 Every job runs this at the end, but you can run it any time on a login node:
 
 ```
-module load python3/3.8.5 && . /scratch/jq77/nk8155/tft_env/bin/activate && python collect_results.py --latest
+. /scratch/jq77/nk8155/tft_env/bin/activate && python collect_results.py --latest
 ```
 
 It writes `results/all_results.csv` and prints the confidence-0.80 summary:

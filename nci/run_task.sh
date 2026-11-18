@@ -28,6 +28,16 @@ PY=$4
 shift 4
 
 cd "$ROOT" || { echo "run_task.sh: cannot cd to $ROOT" >&2; exit 1; }
+
+# A venv built on a module python cannot start without that module's
+# LD_LIBRARY_PATH. Report that in the JOB log, rather than leaving thousands of
+# task logs each holding one cryptic linker error.
+if ! "$PY" -c '' 2>/dev/null; then
+    echo "run_task.sh: $PY cannot start. Is PY_MODULES right in sweep.pbs?" >&2
+    echo "  LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-<empty>}" >&2
+    "$PY" -c '' || true          # let the real linker error through to the log
+    exit 1
+fi
 mkdir -p "$(dirname "$LOG")" || exit 1
 
 # one task must not grab the whole node's cores: each gets THREADS of them

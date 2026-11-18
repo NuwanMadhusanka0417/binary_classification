@@ -48,9 +48,16 @@
 
 # ---------------- settings (edit here, or override with qsub -v) -------------
 ROOT=${ROOT:-/scratch/jq77/nk8155/Binary_classification/binary_classification}
-PY=${PY:-/scratch/jq77/nk8155/tft_env/bin/python}     # python that runs the code
-PY_MODULES=${PY_MODULES:-python3/3.8.5}               # module tft_env was built on;
-                                                      # set PY_MODULES="" for a conda env
+PY=${PY:-/scratch/jq77/nk8155/env2/bin/python}        # python that runs the code
+# Modules to load before PY. env2 is a Python 3.8 venv built on the
+# python3/3.8.5 module, so that module MUST be loaded -- without it the
+# interpreter cannot even start:
+#   "error while loading shared libraries: libpython3.8.so.1.0"
+# Use PY_MODULES="" only for a self-contained conda env (see nci/make_env.sh).
+# Do NOT use tft_env: it is a 3.11 venv whose compiled stdlib comes from a
+# different 3.11 point release, so every C extension fails with
+# "undefined symbol: _PyModule_Add".
+PY_MODULES=${PY_MODULES:-python3/3.8.5}
 SWEEP_GROUPS=${SWEEP_GROUPS:-ED}                      # ED tox21 HTSFP10
 STAGES=${STAGES:-"1 2 3"}
 TUNE=${TUNE:-50}                                      # Optuna trials for xgb; 0 = untuned
@@ -122,7 +129,10 @@ run_stage() {
     echo "== $(date '+%F %T') $(basename "$file"): $n tasks"
     [ "$n" -eq 0 ] && return 0
     before=$(find logs -name '*.log' 2>/dev/null | wc -l)
+    # -x forwards the module's library and binary paths to every task, so a
+    # venv built on a module python can still find libpython3.8.so.1.0
     mpirun -np "$NTASKS" --map-by "$MAP" \
+           -x PATH -x LD_LIBRARY_PATH \
            nci-parallel --input-file "$file" --timeout "$TASK_TIMEOUT"
     # job 184162620 ran all three stages in 34 s because not one task started.
     # Stop at the first stage that produces no log at all, rather than marching

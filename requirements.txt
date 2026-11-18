@@ -1,0 +1,25 @@
+# CPU-only environment for Python 3.8.5.
+# Install with: python -m pip install --no-cache-dir -r requirements.txt
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+numpy==1.24.4
+pandas==1.4.4
+scipy==1.10.1
+scikit-learn==1.0.2
+joblib==1.4.2
+
+torch==2.0.1+cpu
+torch-geometric==2.6.1
+
+rdkit==2023.9.5
+networkx==2.8.8
+deepchem==2.6.1
+
+xgboost==1.6.2
+optuna==3.6.1
+
+matplotlib==3.5.3
+seaborn==0.13.2
+ipython==8.12.3
+typing-extensions==4.12.2
