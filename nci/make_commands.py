@@ -2,7 +2,7 @@
 '''
 make_commands.py -- write the command lists for a full sweep on NCI Gadi.
 
-Three stages, each a plain text file with one shell command per line, run by
+Four stages, each a plain text file with one shell command per line, run by
 nci-parallel inside nci/sweep.pbs:
 
   stage1_prepare.txt  one line per dataset: RDKit descriptors + the shared
@@ -12,6 +12,7 @@ nci-parallel inside nci/sweep.pbs:
                       cache the GVFA embeddings once.
   stage3_runs.txt     one line per experiment (dataset x features x nf x dim x
                       classifier x balance). Reads the caches only.
+  stage4_tuning.txt   RF/LR/XGB tuning at concat / nf18 / dim1000.
 
 Each line is `/bin/bash nci/run_task.sh <root> <threads> <log> <python> ...`:
 nci-parallel execs its input lines WITHOUT a shell, so a line cannot contain
@@ -86,6 +87,8 @@ def main():
                     help='0 = off, 1 = on; "0 1" runs both')
     ap.add_argument('--tune', type=int, default=0,
                     help='Optuna trials for xgb runs (0 = untuned)')
+    ap.add_argument('--tune-others', type=int, default=0,
+                    help='stage-4 Optuna trials for RF/LR/XGB (0 = off)')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--folds', type=int, default=10)
     ap.add_argument('--threads', type=int, default=12,
@@ -93,6 +96,8 @@ def main():
     ap.add_argument('--python', default=sys.executable,
                     help='python of the gvfa environment (absolute path)')
     ap.add_argument('--results-dir', default='results')
+    ap.add_argument('--tuning-results-dir', default='results_tuned_dim1000',
+                    help='stage-4 results root')
     ap.add_argument('--cache-dir', default='cache')
     ap.add_argument('--out-dir', default='nci/cmds')
     ap.add_argument('--log-dir', default='logs')
@@ -119,16 +124,18 @@ def main():
     # characters a shell would act on; ~ # ! are literal mid-word, so allowed
     UNSAFE = re.compile(r'''[\s'"|&;<>()$`\*?\[\]{}]''')
 
-    def command(tr, te, group, log, extra):
+    def command(tr, te, group, log, extra, script=None, results_dir=None):
         # nci-parallel execs this line directly -- no shell -- so it must be
         # plain whitespace-separated words. run_task.sh does the cd, the
         # thread limits and the redirection.
-        words = ['/bin/bash', str(runner), str(ROOT), str(t), log, args.python,
-                 '-i', str(tr), '-p', str(te), '--group', group,
+        words = ['/bin/bash', str(runner), str(ROOT), str(t), log, args.python]
+        if script is not None:
+            words.append(script)
+        words += ['-i', str(tr), '-p', str(te), '--group', group,
                  '--seed', str(args.seed), '--folds', str(args.folds),
                  '--n-jobs', str(t),
                  '--cache-dir', args.cache_dir,
-                 '--results-dir', args.results_dir] + list(extra)
+                 '--results-dir', results_dir or args.results_dir] + list(extra)
         bad = [w for w in words if not w or UNSAFE.search(w)]
         if bad:
             raise SystemExit(
@@ -136,7 +143,7 @@ def main():
                 'nci-parallel cannot do: ' + repr(bad))
         return ' '.join(words)
 
-    stage1, stage2, stage3 = [], [], []
+    stage1, stage2, stage3, stage4 = [], [], [], []
     n_total = n_done = 0
     for group in args.groups:
         log_dir = f'{args.log_dir}/{group}'
@@ -179,10 +186,36 @@ def main():
                 cost = size * max(dim, 100) * (args.tune if tune else 1)
                 stage3.append((cost, command(tr, te, group, f'{log_dir}/{tag}.log', extra)))
 
+            if args.tune_others:
+                for clf in args.clfs:
+                    tag = run_tag(
+                        ds, 'concat', 18, 1000, clf, False,
+                        args.tune_others, args.seed, args.folds)
+                    if finished(
+                            ROOT / args.tuning_results_dir, group, tag):
+                        continue
+                    extra = [
+                        '--features', 'concat',
+                        '--node-features', '18',
+                        '--dim', '1000',
+                        '--clf', clf,
+                        '--trials', str(args.tune_others),
+                    ]
+                    cost = size * 1000 * args.tune_others
+                    stage4.append((
+                        cost,
+                        command(
+                            tr, te, group, f'{log_dir}/{tag}.log', extra,
+                            script='Run_other_classifier_tuning.py',
+                            results_dir=args.tuning_results_dir),
+                    ))
+
     for fname, lines in (('stage1_prepare.txt', stage1), ('stage2_embed.txt', stage2),
-                         ('stage3_runs.txt', stage3)):
+                         ('stage3_runs.txt', stage3),
+                         ('stage4_tuning.txt', stage4)):
         lines.sort(key=lambda x: -x[0])
-        (out_dir / fname).write_text(''.join(c + '\n' for _, c in lines))
+        (out_dir / fname).write_text(
+            ''.join(c + '\n' for _, c in lines), encoding='utf-8')
         print(f'{out_dir / fname}: {len(lines)} commands')
     print(f'experiments: {n_total} in the grid, {n_done} already finished, '
           f'{len(stage3)} to run')

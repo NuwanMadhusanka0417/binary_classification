@@ -517,7 +517,8 @@ def main():
               'host': platform.node(), 'pbs_jobid': os.environ.get('PBS_JOBID', ''),
               'command': ' '.join(sys.argv), 'versions': package_versions()}
     config_path = config_dir / f'{run_id}.json'
-    config_path.write_text(json.dumps(config, indent=2, default=str))
+    config_path.write_text(
+        json.dumps(config, indent=2, default=str), encoding='utf-8')
 
     print(f'saved  metrics {metrics_path}\n       p-values {pval_path}\n'
           f'       config  {config_path}')

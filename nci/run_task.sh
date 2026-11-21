@@ -11,8 +11,10 @@
 # This script does all of that itself, so each task line is a plain list of
 # whitespace-separated words that execs cleanly with no shell involved.
 #
-# Called by nci/make_commands.py as:
-#   /bin/bash <this script> <root> <threads> <logfile> <python> <args for Run_experiment.py...>
+# Called by nci/make_commands.py as either:
+#   /bin/bash <this> <root> <threads> <log> <python> <args...>
+#   /bin/bash <this> <root> <threads> <log> <python> <script.py> <args...>
+# The first form remains backward compatible and runs Run_experiment.py.
 # =============================================================================
 set -u
 
@@ -26,6 +28,12 @@ THREADS=$2
 LOG=$3
 PY=$4
 shift 4
+SCRIPT=Run_experiment.py
+case ${1:-} in
+    -*) ;;
+    '') ;;
+    *) SCRIPT=$1; shift ;;
+esac
 
 cd "$ROOT" || { echo "run_task.sh: cannot cd to $ROOT" >&2; exit 1; }
 
@@ -50,4 +58,4 @@ export TF_CPP_MIN_LOG_LEVEL=3
 # its log up to the point it died, instead of an empty file.
 export PYTHONUNBUFFERED=1
 
-exec "$PY" Run_experiment.py "$@" > "$LOG" 2>&1
+exec "$PY" "$SCRIPT" "$@" > "$LOG" 2>&1

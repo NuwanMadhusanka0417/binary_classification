@@ -14,6 +14,7 @@
 #   1  prepare  RDKit descriptors + shared split, one task per dataset
 #   2  embed    GVFA embeddings, one task per dataset x node-features x dim
 #   3  runs     every experiment; reads the caches only
+#   4  tune     RF/LR/XGB at concat, nf18, dim1000; reads the caches only
 # Finished work is skipped, so if the job hits its walltime submit it again.
 #
 # Submit from the project root.
@@ -28,6 +29,7 @@
 #     J=$(qsub -v SWEEP_GROUPS=HTSFP10,STAGES=1+2 nci/sweep.pbs)
 #     qsub -W depend=afterok:$J -v SWEEP_GROUPS=HTSFP10,STAGES=3,CLFS=xgb nci/sweep.pbs
 #     qsub -W depend=afterok:$J -v SWEEP_GROUPS=HTSFP10,STAGES=3,CLFS=rf+lr nci/sweep.pbs
+#   Like-for-like tuning: qsub -v SWEEP_GROUPS=ED,STAGES=2+4,DIMS=1000,NODE_FEATURES=18,TUNE_OTHERS=50 nci/sweep.pbs
 #   Do NOT run two jobs with stage 1 for the same group at the same time.
 # (qsub -v separates variables with commas, so a LIST uses +: DIMS=500+1000)
 # =============================================================================
@@ -61,6 +63,7 @@ PY_MODULES=${PY_MODULES:-python3/3.8.5}
 SWEEP_GROUPS=${SWEEP_GROUPS:-ED}                      # ED tox21 HTSFP10
 STAGES=${STAGES:-"1 2 3"}
 TUNE=${TUNE:-50}                                      # Optuna trials for xgb; 0 = untuned
+TUNE_OTHERS=${TUNE_OTHERS:-0}                         # stage-4 trials; 0 = off
 FEATURES=${FEATURES:-"gvfa concat bundle"}
 RDKIT=${RDKIT:-1}                                     # 1 = also rdkit-only baseline
 DIMS=${DIMS:-"100 500 1000 2000 5000 10000"}
@@ -101,27 +104,34 @@ need = ["numpy", "pandas", "sklearn", "torch", "xgboost", "rdkit", "torch_geomet
 miss = [m for m in need if importlib.util.find_spec(m) is None]
 print("python", sys.version.split()[0], "| missing:", miss or "nothing")
 sys.exit(1 if miss else 0)' || { echo "ABORT: packages missing in $PY"; exit 1; }
-if [ "$TUNE" -gt 0 ] && ! "$PY" -c 'import optuna' 2>/dev/null; then
-    echo "ABORT: TUNE=$TUNE needs optuna, which $PY does not have (or use TUNE=0)"; exit 1
+if { [ "$TUNE" -gt 0 ] || [ "$TUNE_OTHERS" -gt 0 ]; } && \
+   ! "$PY" -c 'import optuna' 2>/dev/null; then
+    echo "ABORT: tuning needs optuna, which $PY does not have"; exit 1
 fi
 
 JOB=${PBS_JOBID%%.*}
 CMDS=nci/cmds/$JOB                                    # per job: parallel jobs never share
 RESULTS=${RESULTS:-results}                           # where every run writes
-mkdir -p "$CMDS" logs "$RESULTS" cache splits
+TUNING_RESULTS=${TUNING_RESULTS:-results_tuned_dim1000}
+mkdir -p "$CMDS" logs "$RESULTS" "$TUNING_RESULTS" cache splits
 
 MEM_GB=$(( ${PBS_VMEM:-204010946560} / 1073741824 ))
 echo "== $(date '+%F %T') job $JOB: $PBS_NCPUS cores, ~${MEM_GB} GB; $NTASKS tasks x $NCORES_PER_TASK cores" \
-     "(~$((MEM_GB / NTASKS)) GB each); groups: $SWEEP_GROUPS; stages: $STAGES; tune: $TUNE"
+     "(~$((MEM_GB / NTASKS)) GB each); groups: $SWEEP_GROUPS; stages: $STAGES;" \
+     "tune: $TUNE; tune-others: $TUNE_OTHERS"
 
 "$PY" nci/make_commands.py \
     --groups $SWEEP_GROUPS --features $FEATURES --rdkit "$RDKIT" \
     --dims $DIMS --node-features $NODE_FEATURES --clfs $CLFS --balance $BALANCE \
-    --tune "$TUNE" --folds "$FOLDS" --seed "$SEED" \
+    --tune "$TUNE" --tune-others "$TUNE_OTHERS" \
+    --tuning-results-dir "$TUNING_RESULTS" --folds "$FOLDS" --seed "$SEED" \
     --threads "$NCORES_PER_TASK" --python "$PY" \
     --results-dir "$RESULTS" --out-dir "$CMDS" || exit 1
 
-count_metrics() { find "$RESULTS/metrics" -name '*.csv' 2>/dev/null | wc -l; }
+count_metrics() {
+    local root=${1:-$RESULTS}
+    find "$root/metrics" -name '*.csv' 2>/dev/null | wc -l
+}
 
 run_stage() {
     local file=$1 n before after
@@ -164,18 +174,34 @@ for s in $STAGES; do
                grep -l "Traceback" logs/*/*.log 2>/dev/null | head -5
                exit 1
            fi ;;
+        4) before_m=$(count_metrics "$TUNING_RESULTS")
+           run_stage "$CMDS/stage4_tuning.txt"
+           after_m=$(count_metrics "$TUNING_RESULTS")
+           echo "   tuned metrics files: $before_m -> $after_m ($((after_m - before_m)) new)"
+           if [ "$after_m" -le "$before_m" ]; then
+               echo "ABORT: stage 4 ran but wrote no results into $TUNING_RESULTS/metrics."
+               echo "       Look at the task logs named just above, and at:"
+               grep -l "Traceback" logs/*/*.log 2>/dev/null | head -5
+               exit 1
+           fi ;;
         *) echo "unknown stage $s" ;;
     esac
 done
 
 echo "== $(date '+%F %T') merging results"
 "$PY" collect_results.py --results-dir "$RESULTS" --latest || true   # none yet is not a failure
+if [ "$TUNING_RESULTS" != "$RESULTS" ]; then
+    "$PY" collect_results.py --results-dir "$TUNING_RESULTS" --latest || true
+fi
 
 echo "== $(date '+%F %T') results in $ROOT/$RESULTS"
 echo "   metrics : $(count_metrics) files   ($RESULTS/metrics/<group>/<run_id>.csv)"
 echo "   pvalues : $(find "$RESULTS/pvalues" -name '*.csv' 2>/dev/null | wc -l) files"
 echo "   configs : $(find "$RESULTS/configs" -name '*.json' 2>/dev/null | wc -l) files"
 echo "   merged  : $RESULTS/all_results.csv"
+if [ "$TUNE_OTHERS" -gt 0 ]; then
+    echo "   tuned   : $(count_metrics "$TUNING_RESULTS") metrics in $TUNING_RESULTS"
+fi
 
 echo "== $(date '+%F %T') done"
 echo "failed tasks (if any):"

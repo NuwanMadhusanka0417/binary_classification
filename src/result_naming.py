@@ -33,7 +33,7 @@ def run_tag(dataset, features, node_features, dim, clf, balance, tune, seed,
     parts.append(clf)
     if balance:
         parts.append('bal')
-    if tune and clf == 'xgb':                    # --tune only acts on xgb
+    if tune:
         parts.append(f'tune{tune}')
     parts += [f'seed{seed}', f'k{folds}']
     return '_'.join(parts)

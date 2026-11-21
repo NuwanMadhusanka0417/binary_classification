@@ -10,6 +10,7 @@ subsets are not comparable, because coverage differs per configuration.
 Usage:
   python analyse_results.py                         # results/
   python analyse_results.py results/2026_11_18      # a dated snapshot
+  python analyse_results.py results results_tuned_dim1000
   python analyse_results.py --eps 0.20              # one confidence level
 '''
 import argparse
@@ -28,10 +29,15 @@ except ImportError:
 EPS_MAIN = 0.20          # confidence 0.80, the Figure 1 criterion
 
 
-def load(root):
-    files = sorted(glob.glob(os.path.join(root, 'metrics', '*', '*.csv')))
+def load(roots):
+    files = sorted({
+        path
+        for root in roots
+        for path in glob.glob(os.path.join(root, 'metrics', '*', '*.csv'))
+    })
     if not files:
-        sys.exit(f'no metrics files under {root}/metrics')
+        sys.exit('no metrics files under: ' + ', '.join(
+            os.path.join(root, 'metrics') for root in roots))
     df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True, sort=False)
     print(f'{len(files)} files, {df.run_id.nunique()} runs, '
           f'{df.dataset.nunique()} datasets, {len(df)} rows\n')
@@ -64,13 +70,60 @@ def paired(df, col, va, vb, keys, label, metric='eff'):
     return j
 
 
+def tuned_classifier_comparison(df, clf):
+    """Matched tuned-vs-untuned report for one fixed representation."""
+    fixed = df[
+        (df.features == 'concat') &
+        (df.node_features == 18) &
+        (df.dim == 1000) &
+        (df.clf == clf)
+    ]
+    keys = ['dataset', 'balance', 'seed', 'folds']
+    tuned = fixed[fixed.tuned].set_index(keys)
+    plain = fixed[~fixed.tuned].set_index(keys)
+    tuned = tuned[~tuned.index.duplicated()]
+    plain = plain[~plain.index.duplicated()]
+    joined = tuned[['eff', 'valid', 'runtime_s']].join(
+        plain[['eff', 'valid', 'runtime_s']], how='inner',
+        lsuffix='_tuned', rsuffix='_untuned')
+    if not len(joined):
+        print(f'  {clf:4s} no matched pairs')
+        return
+
+    difference = joined.eff_tuned - joined.eff_untuned
+    try:
+        p_eff = stats.wilcoxon(
+            joined.eff_tuned, joined.eff_untuned).pvalue
+    except ValueError:
+        p_eff = 1.0
+    fixed_validity = int(
+        (joined.valid_tuned & ~joined.valid_untuned).sum())
+    broke_validity = int(
+        (~joined.valid_tuned & joined.valid_untuned).sum())
+    discordant = fixed_validity + broke_validity
+    p_valid = (stats.binomtest(
+        fixed_validity, discordant, 0.5).pvalue
+        if discordant else np.nan)
+
+    print(
+        f'  {clf:4s} n={len(joined):3d}  eff '
+        f'{joined.eff_tuned.mean():.3f} vs '
+        f'{joined.eff_untuned.mean():.3f} '
+        f'({difference.mean():+.3f}) p={p_eff:.4f}  |  valid '
+        f'{joined.valid_tuned.mean():.0%} vs '
+        f'{joined.valid_untuned.mean():.0%} '
+        f'(fixed {fixed_validity}, broke {broke_validity}, p={p_valid:.4f})  |  '
+        f'median runtime {joined.runtime_s_tuned.median():.0f}s vs '
+        f'{joined.runtime_s_untuned.median():.0f}s')
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('root', nargs='?', default='results')
+    ap.add_argument('roots', nargs='*', default=['results'])
     ap.add_argument('--eps', type=float, default=EPS_MAIN)
     args = ap.parse_args()
 
-    df = load(args.root)
+    df = load(args.roots)
     c = df[np.isclose(df.eps, args.eps)].copy()
     print(f'--- comparisons at eps={args.eps:.2f} (confidence {1-args.eps:.2f}) ---\n')
 
@@ -115,6 +168,11 @@ def main():
     paired(c, 'dim', 10000, 500,
            ['dataset', 'features', 'node_features', 'clf', 'tuned', 'balance'],
            'dim 10000 vs 500')
+    print()
+
+    print('TUNED VS UNTUNED AT CONCAT / NF18 / DIM1000')
+    for clf in ['rf', 'lr', 'xgb']:
+        tuned_classifier_comparison(c, clf)
     print()
 
     print('FEATURE SETS')

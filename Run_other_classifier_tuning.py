@@ -1,10 +1,14 @@
 #!/usr/bin/env python
-"""Tune Random Forest or Logistic Regression with conformal efficiency.
+"""Tune RF, LR or XGBoost against the same conformal-efficiency objective.
 
-This is the RF/LR companion to Run_experiment.py. It reuses the same cached
+This is the tuning companion to Run_experiment.py. It reuses the same cached
 features, shared splits, cross-conformal prediction, output format and tuning
 objective. Optuna searches on training data only and maximises singleton
 efficiency at 80% confidence; invalid candidates receive a one-point penalty.
+
+The existing XGBoost studies and this runner are not interchangeable study
+populations: use this runner when making the like-for-like RF/LR/XGB comparison,
+because every classifier here is selected by conformal efficiency.
 """
 
 import argparse
@@ -24,6 +28,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+from xgboost import XGBClassifier
 
 from Run_experiment import (
     EPS_LEVELS,
@@ -35,6 +40,8 @@ from Run_experiment import (
     new_run_id,
     package_versions,
     rdkit_descriptors,
+    xgb_default,
+    xgb_space,
 )
 from src.load_data import (
     check_feasible,
@@ -49,7 +56,7 @@ from src.result_naming import run_tag, short_dataset_name
 
 
 def rf_search_params(trial):
-    """Random Forest search space, including the class-weight strategy."""
+    """Random Forest search space; balancing is a separate protocol setting."""
     return {
         'n_estimators': trial.suggest_int('n_estimators', 200, 800, step=100),
         'max_depth': trial.suggest_categorical(
@@ -59,59 +66,60 @@ def rf_search_params(trial):
         'max_features': trial.suggest_categorical(
             'max_features', ['sqrt', 'log2', 0.5, 0.8]),
         'bootstrap': trial.suggest_categorical('bootstrap', [True, False]),
-        'class_weight': trial.suggest_categorical(
-            'class_weight', [None, 'balanced', 'balanced_subsample']),
     }
 
 
 def lr_search_params(trial):
-    """Logistic Regression search space, including class weighting."""
+    """Logistic Regression search space; balancing is fixed by --balance."""
     return {
         'C': trial.suggest_float('C', 1e-4, 1e3, log=True),
         'penalty': trial.suggest_categorical('penalty', ['l1', 'l2']),
         'tol': trial.suggest_float('tol', 1e-6, 1e-2, log=True),
         'fit_intercept': trial.suggest_categorical(
             'fit_intercept', [True, False]),
-        'class_weight': trial.suggest_categorical(
-            'class_weight', [None, 'balanced']),
     }
 
 
-def build_model(clf, params, n_jobs, seed):
+def class_weight_for(clf, balance):
+    if not balance or clf == 'xgb':
+        return None
+    return 'balanced_subsample' if clf == 'rf' else 'balanced'
+
+
+def build_model(clf, params, n_jobs, seed, balance):
     if clf == 'rf':
         estimator = RandomForestClassifier(
-            **params, n_jobs=n_jobs, random_state=seed)
+            **params, n_jobs=n_jobs, random_state=seed,
+            class_weight=class_weight_for(clf, balance))
         return make_pipeline(SimpleImputer(strategy='median'), estimator)
 
-    estimator = LogisticRegression(
-        **params, solver='liblinear', max_iter=3000, random_state=seed)
-    return make_pipeline(
-        SimpleImputer(strategy='median'),
-        StandardScaler(),
-        estimator,
-    )
+    if clf == 'lr':
+        estimator = LogisticRegression(
+            **params, solver='liblinear', max_iter=3000, random_state=seed,
+            class_weight=class_weight_for(clf, balance))
+        return make_pipeline(
+            SimpleImputer(strategy='median'),
+            StandardScaler(),
+            estimator,
+        )
 
-
-def tuned_tag(dataset, features, node_features, dim, clf, balanced, trials,
-              seed, folds):
-    """Make a run tag that records tuning for RF/LR without changing shared code."""
-    tag = run_tag(dataset, features, node_features, dim, clf, balanced, 0,
-                  seed, folds)
-    marker = f'_seed{seed}_'
-    return tag.replace(marker, f'_tune{trials}{marker}', 1)
+    return XGBClassifier(**params)
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description='Optuna tuning for Random Forest and Logistic Regression')
+        description='Conformal-efficiency tuning for RF, LR and XGBoost')
     ap.add_argument('-i', '--infile', required=True)
     ap.add_argument('-p', '--predfile', required=True)
     ap.add_argument('--features', default='concat',
                     choices=['gvfa', 'concat', 'bundle', 'rdkit'])
     ap.add_argument('--dim', type=int, default=500)
     ap.add_argument('--node-features', type=int, default=18, choices=[7, 18])
-    ap.add_argument('--clf', required=True, choices=['rf', 'lr'])
+    ap.add_argument('--clf', required=True, choices=['rf', 'lr', 'xgb'])
     ap.add_argument('--trials', type=int, default=50)
+    ap.add_argument('--balance', action='store_true')
+    ap.add_argument('--eval-metric', default='aucpr',
+                    choices=['aucpr', 'logloss'])
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--folds', type=int, default=10)
     ap.add_argument('--group', default='')
@@ -129,6 +137,10 @@ def main():
 
     import optuna
     optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    if args.clf == 'lr':
+        print('WARNING: tuned LR uses solver=liblinear for the l1/l2 search; '
+              'the untuned baseline uses solver=lbfgs.')
 
     torch.set_num_threads(args.n_jobs)
     started_at = time.time()
@@ -167,19 +179,38 @@ def main():
         return
 
     n_per_class = {c: int((y_train == c).sum()) for c in (0, 1)}
+    pos_weight = (n_per_class[0] / max(n_per_class[1], 1)
+                  if args.balance else 1.0)
 
     # Tune on fold 0's fit rows, with disjoint inner fit/calibration sets.
     f0, tune_eval_rows, _ = fold_indices(splits, 0)
     inner_fit, inner_cal = train_test_split(
         f0, test_size=0.25, stratify=y_train[f0],
         random_state=args.seed + 1)
-    Xt = X_tr if X_tr is not None else bundle_fn(inner_fit)[0]
+    tune_fit = inner_fit
+    inner_es = None
+    if args.clf == 'xgb':
+        tune_fit, inner_es = train_test_split(
+            inner_fit, test_size=0.2, stratify=y_train[inner_fit],
+            random_state=args.seed + 1)
+    Xt = X_tr if X_tr is not None else bundle_fn(tune_fit)[0]
 
     def objective(trial):
-        params = (rf_search_params(trial) if args.clf == 'rf'
-                  else lr_search_params(trial))
-        model = build_model(args.clf, params, args.n_jobs, args.seed)
-        model.fit(Xt[inner_fit], y_train[inner_fit])
+        if args.clf == 'rf':
+            params = rf_search_params(trial)
+        elif args.clf == 'lr':
+            params = lr_search_params(trial)
+        else:
+            params = xgb_space(trial, pos_weight, args.eval_metric)
+            params['n_jobs'] = args.n_jobs
+        model = build_model(
+            args.clf, params, args.n_jobs, args.seed, args.balance)
+        if args.clf == 'xgb':
+            model.fit(
+                Xt[tune_fit], y_train[tune_fit],
+                eval_set=[(Xt[inner_es], y_train[inner_es])], verbose=False)
+        else:
+            model.fit(Xt[tune_fit], y_train[tune_fit])
 
         p_cal = model.predict_proba(Xt[inner_cal])
         p_eval = model.predict_proba(Xt[tune_eval_rows])
@@ -199,14 +230,23 @@ def main():
         direction='maximize',
         sampler=optuna.samplers.TPESampler(seed=args.seed))
     study.optimize(objective, n_trials=args.trials)
-    best_params = dict(study.best_params)
-    print(f'optuna best {study.best_value:.4f}: {best_params}')
+    best_search_params = dict(study.best_params)
+    if args.clf == 'xgb':
+        best_params = xgb_default(pos_weight, args.eval_metric)
+        best_params['n_jobs'] = args.n_jobs
+        best_params['colsample_bytree'] = 1.0
+        best_params.update(best_search_params)
+    else:
+        best_params = best_search_params
+    print(f'optuna best {study.best_value:.4f}: {best_search_params}')
 
     tune_info = {
         'n_trials': args.trials,
         'best_value': study.best_value,
-        'best_params': best_params,
+        'best_params': best_search_params,
         'objective_confidence': 0.80,
+        'class_weight': class_weight_for(args.clf, args.balance),
+        'solver': 'liblinear' if args.clf == 'lr' else None,
     }
 
     # Refit the winning configuration in every cross-conformal fold.
@@ -217,9 +257,16 @@ def main():
         if bundle_fn is not None:
             X_tr, X_te = bundle_fn(fit_rows)
 
-        model = build_model(args.clf, best_params, args.n_jobs, args.seed)
-        train_rows = np.concatenate([fit_rows, tune_rows])
-        model.fit(X_tr[train_rows], y_train[train_rows])
+        model = build_model(
+            args.clf, best_params, args.n_jobs, args.seed, args.balance)
+        if args.clf == 'xgb':
+            model.fit(
+                X_tr[fit_rows], y_train[fit_rows],
+                eval_set=[(X_tr[tune_rows], y_train[tune_rows])],
+                verbose=False)
+        else:
+            train_rows = np.concatenate([fit_rows, tune_rows])
+            model.fit(X_tr[train_rows], y_train[train_rows])
 
         p_cal = model.predict_proba(X_tr[cal_rows])
         fold_cal.append({
@@ -233,10 +280,9 @@ def main():
 
     group = args.group or 'nogroup'
     dataset = short_dataset_name(args.infile)
-    balanced = best_params.get('class_weight') is not None
-    tag = tuned_tag(
+    tag = run_tag(
         dataset, args.features, args.node_features, args.dim, args.clf,
-        balanced, args.trials, args.seed, args.folds)
+        args.balance, args.trials, args.seed, args.folds)
 
     root = Path(args.results_dir)
     metrics_dir = root / 'metrics' / group
@@ -273,8 +319,9 @@ def main():
             node_features=(args.node_features
                            if args.features != 'rdkit' else 0),
             clf=args.clf, seed=args.seed, folds=args.folds,
-            tuned=True, n_trials=args.trials, balance=balanced,
-            eval_metric='', n_train=len(y_train),
+            tuned=True, n_trials=args.trials, balance=args.balance,
+            eval_metric=(args.eval_metric if args.clf == 'xgb' else ''),
+            n_train=len(y_train),
             n_active_train=n_per_class[1], n_test=len(y_test),
             n_active_test=int(y_test.sum()),
             n_cal_active=n_per_class[1],
@@ -320,7 +367,8 @@ def main():
         'versions': package_versions(),
     }
     config_path = config_dir / f'{run_id}.json'
-    config_path.write_text(json.dumps(config, indent=2, default=str))
+    config_path.write_text(
+        json.dumps(config, indent=2, default=str), encoding='utf-8')
 
     print(
         f'saved  metrics {metrics_path}\n'
